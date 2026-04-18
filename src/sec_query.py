@@ -36,20 +36,31 @@ Basic usage:
 
 import asyncio
 import json
-import re
 from datetime import date
 from typing import AsyncGenerator, Optional
 
-from llama_index.core import VectorStoreIndex
+from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.base.base_query_engine import BaseQueryEngine
 from llama_index.core.base.response.schema import RESPONSE_TYPE, Response
 from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler
+from llama_index.core.prompts import PromptTemplate
 from llama_index.core.schema import QueryBundle, NodeWithScore
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, FilterOperator
-from llama_index.core import Settings
+from pydantic import BaseModel, Field
 
 from filing_parser import FilingInfo, parse_filing_filename
+
+
+# ---------------------------------------------------------------------------
+# Structured output schema for query planning
+# ---------------------------------------------------------------------------
+
+class QueryPlan(BaseModel):
+    tickers: list[str] = Field(description="Ticker symbols to query, e.g. ['AAPL', 'MSFT']")
+    years: list[int] = Field(description="Fiscal years to query, e.g. [2023, 2024]")
+    filing_types: list[str] = Field(description="Filing types to query: '10-K', '10-Q', or both")
+    reasoning: str = Field(description="One sentence explanation of why these tickers/years/types were chosen")
 
 
 # ---------------------------------------------------------------------------
@@ -225,11 +236,8 @@ class SecQueryEngine:
             coverage[t]["types"].add(m["filing_type"])
         return coverage
 
-    def _plan_query(self, query: str) -> dict:
-        """
-        LLM call #1 (before retrieval): resolve tickers, years, and filing types.
-        Grounded against manifest coverage so it can't hallucinate missing data.
-        """
+    def _build_plan_prompt(self) -> PromptTemplate:
+        """Build the planning PromptTemplate, grounded against current manifest coverage."""
         coverage_summary = {
             ticker: {
                 "years": sorted(info["years"]),
@@ -238,54 +246,73 @@ class SecQueryEngine:
             }
             for ticker, info in self._coverage.items()
         }
+        return PromptTemplate(
+            f"""Today's date is {date.today().isoformat()}.
+You are a query planner for a SEC EDGAR filings database.
 
-        prompt = f"""
-Today's date is {date.today().isoformat()}.
-
-You are a query planner for a SEC filings database.
-Here is EXACTLY what is available — do not reference anything outside this:
+# Available data (ONLY use tickers/years from this list):
 {json.dumps(coverage_summary, indent=2)}
 
-Given this query: "{query}"
+# Query
+"{{query}}"
 
-Return a JSON query plan with this structure:
-{{
-  "tickers": ["AAPL", "MSFT"],
-  "years": [2023, 2024],
-  "filing_types": ["10-K"],
-  "reasoning": "brief explanation"
-}}
+# Instructions
+Think step by step before producing the plan:
 
-Rules:
-- Resolve sector/industry terms (e.g. "pharma" → PFE, JNJ, MRK, LLY, ABBV)
-- Resolve relative time (e.g. "last 2 years" → the 2 most recent years in the data)
-- "annual report" or "10-K" → ["10-K"] only
-- "quarterly" or "10-Q"    → ["10-Q"] only
-- unspecified filing type  → ["10-K", "10-Q"]
-- Only include tickers that actually have data for the requested years
-- If query is broad ("all companies"), include all tickers
+1. TICKERS: Identify which companies are relevant.
+   - Named directly ("Apple", "AAPL") → include that ticker
+   - Sector/industry terms → map to all matching tickers in the available data
+     e.g. "pharma" → any ticker where industry contains "Pharmaceutical"
+     e.g. "big tech" → AAPL, MSFT, GOOG, META, AMZN, NVDA
+     e.g. "banks" → JPM, BAC, GS, MS if present
+   - "all companies" or no company specified → return all available tickers
+   - Only include a ticker if it has data for the resolved years
 
-Respond with ONLY the JSON object, no explanation outside it.
+2. YEARS: Identify the fiscal year(s) needed.
+   - Explicit year ("2024", "fiscal 2023") → use that year
+   - "last N years" / "past N years" → the N most recent years in the data
+   - "most recent" / "latest" → single most recent year available per ticker
+   - "since YYYY" → all years from YYYY to most recent
+   - No year specified → all available years for the matched tickers
+
+3. FILING TYPES:
+   - "annual report", "10-K", "yearly" → ["10-K"]
+   - "quarterly", "10-Q", "quarter" → ["10-Q"]
+   - Specific quarter mentioned ("Q3 2024") → ["10-Q"]
+   - Not specified → ["10-K", "10-Q"]
 """
-        response = Settings.llm.complete(prompt)
-        raw = response.text.strip()
-        # Strip markdown code fences if the model wraps the JSON
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw.strip())
-        plan = json.loads(raw)
+        )
 
-        # Clamp to what actually exists in the manifest
-        plan["tickers"] = [
-            t for t in plan["tickers"]
+    def _clamp_plan(self, plan_obj: QueryPlan) -> dict:
+        """Remove tickers/years that don't actually exist in the manifest."""
+        tickers = [
+            t for t in plan_obj.tickers
             if t in self._coverage
-            and any(y in self._coverage[t]["years"] for y in plan["years"])
+            and any(y in self._coverage[t]["years"] for y in plan_obj.years)
         ]
-        plan["years"] = [
-            y for y in plan["years"]
-            if any(y in self._coverage[t]["years"] for t in plan["tickers"])
+        years = [
+            y for y in plan_obj.years
+            if any(y in self._coverage[t]["years"] for t in tickers)
         ]
-        return plan
+        return {
+            "tickers": tickers,
+            "years": years,
+            "filing_types": plan_obj.filing_types,
+            "reasoning": plan_obj.reasoning,
+        }
+
+    def _plan_query(self, query: str) -> dict:
+        """
+        LLM call #1 (before retrieval): resolve tickers, years, and filing types.
+        Uses OpenAI structured output (JSON schema enforcement) — no regex or
+        json.loads needed. Grounded against manifest coverage.
+        """
+        plan_obj: QueryPlan = Settings.llm.structured_predict(
+            QueryPlan,
+            self._build_plan_prompt(),
+            query=query,
+        )
+        return self._clamp_plan(plan_obj)
 
     async def _retrieve_nodes(self, query: str, plan: dict) -> list[NodeWithScore]:
         """
@@ -371,9 +398,13 @@ Answer:"""
                 yield chunk.delta
 
     async def aplan_query(self, query: str) -> dict:
-        """Async wrapper for _plan_query — runs in a thread pool to avoid blocking the event loop."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._plan_query, query)
+        """Async version of _plan_query — uses astructured_predict (non-blocking)."""
+        plan_obj: QueryPlan = await Settings.llm.astructured_predict(
+            QueryPlan,
+            self._build_plan_prompt(),
+            query=query,
+        )
+        return self._clamp_plan(plan_obj)
 
     # ------------------------------------------------------------------
     # LlamaIndex-compatible interface

@@ -1,0 +1,11 @@
+# Extracted corpus files (commit the zip, not the extracted contents)
+files/edgar_corpus/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# IDE
+.idea/

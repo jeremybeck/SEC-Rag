@@ -1,0 +1,4 @@
+llama-index
+llama-index-question-gen-openai
+llama-index-vector-stores-postgres
+psycopg2-binary

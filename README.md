@@ -5,6 +5,7 @@ SEC Filings RAG Application — query SEC 10-K/10-Q filings using LlamaIndex and
 
 - Docker and Docker Compose
 - Python 3.10+
+- Node.js 18+
 - An OpenAI API key
 
 ## Setup
@@ -61,7 +62,34 @@ This will:
 
 This only needs to be run once (or again when new filings are added to the corpus).
 
-## Running a query
+## Running the web app
+
+### API server
+
+```bash
+uvicorn api.server:app --reload --port 8000
+```
+
+The server starts on `http://localhost:8000`. On startup it loads the index from pgvector and initializes the query engine (takes a few seconds).
+
+### Frontend (dev)
+
+In a separate terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. The UI provides:
+- A chat input at the bottom
+- A **Query Plan** banner (appears after the LLM resolves tickers/years)
+- A streaming answer with markdown rendering
+- A **Retrieved Nodes** sidebar on the right (grouped by ticker + filing)
+- Source citation chips below the answer
+
+### CLI (no frontend)
 
 ```bash
 python main.py

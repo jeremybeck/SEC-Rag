@@ -36,14 +36,28 @@ def get_vector_store() -> PGVectorStore:
         )
 
     parsed = urlparse(url)
+    # Build both sync and async connection strings explicitly so LlamaIndex
+    # uses proper connection pools for both paths.
+    db     = parsed.path.lstrip("/")
+    host   = parsed.hostname
+    port   = parsed.port or 5432
+    user   = parsed.username
+    passwd = parsed.password
+
+    sync_url  = f"postgresql+psycopg2://{user}:{passwd}@{host}:{port}/{db}"
+    async_url = f"postgresql+asyncpg://{user}:{passwd}@{host}:{port}/{db}"
+
     return PGVectorStore.from_params(
-        host=parsed.hostname,
-        port=str(parsed.port or 5432),
-        database=parsed.path.lstrip("/"),
-        user=parsed.username,
-        password=parsed.password,
+        connection_string=sync_url,
+        async_connection_string=async_url,
         table_name=TABLE_NAME,
         embed_dim=EMBED_DIM,
+        create_engine_kwargs={
+            "pool_pre_ping": True,   # validate connections before use
+            "pool_recycle": 300,     # recycle connections every 5 min
+            "pool_size": 10,
+            "max_overflow": 20,
+        },
     )
 
 

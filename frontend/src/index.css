@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+  background: #ffffff;
+  color: #1e293b;
+}
+
+/* Markdown prose styles */
+.prose h1, .prose h2, .prose h3 { color: #0f172a; font-weight: 600; margin: 1em 0 0.5em; }
+.prose p { margin: 0.75em 0; line-height: 1.7; color: #334155; }
+.prose ul, .prose ol { padding-left: 1.5em; margin: 0.5em 0; color: #334155; }
+.prose li { margin: 0.25em 0; }
+.prose strong { color: #0f172a; }
+.prose code { background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 0.875em; color: #4f46e5; }
+.prose blockquote { border-left: 3px solid #cbd5e1; padding-left: 1em; color: #64748b; margin: 0.75em 0; }

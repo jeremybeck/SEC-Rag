@@ -28,13 +28,13 @@ from index_loader import get_vector_store
 # CONFIGURATION
 # =========================================================
 
-CORPUS_DIR   = Path(__file__).parent.parent / "files" / "edgar_corpus"
-CHUNK_SIZE   = 1200
-CHUNK_OVERLAP = 150
+CORPUS_DIR    = Path(__file__).parent.parent / "files" / "edgar_corpus"
+CHUNK_SIZE    = 800
+CHUNK_OVERLAP = 200
 
 
 def main() -> None:
-    Settings.embed_model = OpenAIEmbedding()
+    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
 
     print(f"Corpus dir: {CORPUS_DIR}")
 

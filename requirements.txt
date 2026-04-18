@@ -6,3 +6,5 @@ fastapi
 uvicorn[standard]
 sse-starlette
 uvicorn
+torch
+sentence-transformers

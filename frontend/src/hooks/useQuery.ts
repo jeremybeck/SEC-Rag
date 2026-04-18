@@ -1,10 +1,9 @@
 import { useState, useRef } from 'react';
-import type { PlanData, NodeData, SourceData, SSEEvent } from '../types';
+import type { NodeData, SourceData, SSEEvent } from '../types';
 
 const API_URL = 'http://localhost:8000/query';
 
 export function useQuery() {
-  const [plan, setPlan] = useState<PlanData | null>(null);
   const [nodes, setNodes] = useState<NodeData[]>([]);
   const [answer, setAnswer] = useState('');
   const [sources, setSources] = useState<SourceData[]>([]);
@@ -16,7 +15,6 @@ export function useQuery() {
 
   async function submitQuery(query: string) {
     // Reset state
-    setPlan(null);
     setNodes([]);
     setAnswer('');
     setSources([]);
@@ -64,9 +62,6 @@ export function useQuery() {
           }
 
           switch (event.type) {
-            case 'plan':
-              setPlan(event.data);
-              break;
             case 'nodes':
               setNodes(event.data);
               break;
@@ -92,5 +87,5 @@ export function useQuery() {
     }
   }
 
-  return { plan, nodes, answer, sources, isStreaming, error, submitQuery };
+  return { nodes, answer, sources, isStreaming, error, submitQuery };
 }

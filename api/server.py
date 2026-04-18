@@ -35,20 +35,13 @@ from llama_index.llms.openai import OpenAI
 from index_loader import load_index
 from sec_query import SecQueryEngine
 
-MANIFEST_PATH = Path(__file__).parent.parent / "files" / "edgar_corpus" / "manifest.json"
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Settings.embed_model = OpenAIEmbedding()
+    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
     Settings.llm = OpenAI(model="gpt-4o")
 
     index = load_index()
-    app.state.engine = SecQueryEngine(
-        index=index,
-        manifest_path=str(MANIFEST_PATH),
-        verbose=False,
-    )
+    app.state.engine = SecQueryEngine(index=index, verbose=True)
     print("[server] SecQueryEngine ready.")
     yield
 
@@ -78,12 +71,8 @@ async def query_endpoint(request: Request, body: QueryRequest):
 
     async def event_generator():
         try:
-            # Stage 1: Plan
-            plan = await engine.aplan_query(query)
-            yield _event({"type": "plan", "data": plan})
-
-            # Stage 2: Retrieve nodes
-            nodes = await engine._retrieve_nodes(query, plan)
+            # Stage 1: Retrieve nodes (no LLM, pure vector search)
+            nodes = await engine._retrieve_nodes(query)
 
             nodes_payload = []
             for n in nodes:
@@ -95,7 +84,7 @@ async def query_endpoint(request: Request, body: QueryRequest):
                     "fiscal_year":   m.get("fiscal_year"),
                     "fiscal_quarter": m.get("fiscal_quarter"),
                     "section_label": m.get("section_label"),
-                    "score":         round(n.score, 4) if n.score is not None else None,
+                    "score":         round(float(n.score), 4) if n.score is not None else None,
                     "text_preview":  n.node.get_content()[:300],
                 })
             yield _event({"type": "nodes", "data": nodes_payload})

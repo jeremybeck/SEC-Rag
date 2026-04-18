@@ -38,7 +38,7 @@ import asyncio
 import json
 import re
 from datetime import date
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.base.base_query_engine import BaseQueryEngine
@@ -328,11 +328,8 @@ Respond with ONLY the JSON object, no explanation outside it.
                     nodes.append(n)
         return nodes
 
-    def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> str:
-        """
-        LLM call #2 (after retrieval): produce a final answer from retrieved nodes.
-        This is the only generative call made after the retrieval pipeline.
-        """
+    def _build_synthesis_prompt(self, query: str, nodes: list[NodeWithScore]) -> str:
+        """Build the synthesis prompt shared by _synthesize and _synthesize_stream."""
         context_parts = []
         for i, n in enumerate(nodes, 1):
             m = n.node.metadata
@@ -345,7 +342,7 @@ Respond with ONLY the JSON object, no explanation outside it.
             context_parts.append(f"{header}\n{n.node.get_content()}")
         context = "\n\n---\n\n".join(context_parts)
 
-        prompt = f"""You are a financial analyst. Answer the question below using only the provided SEC filing excerpts.
+        return f"""You are a financial analyst. Answer the question below using only the provided SEC filing excerpts.
 Be specific, cite the company and fiscal year where relevant, and be concise.
 
 Question: {query}
@@ -354,8 +351,29 @@ SEC Filing Excerpts:
 {context}
 
 Answer:"""
+
+    def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> str:
+        """
+        LLM call #2 (after retrieval): produce a final answer from retrieved nodes.
+        This is the only generative call made after the retrieval pipeline.
+        """
+        prompt = self._build_synthesis_prompt(query, nodes)
         response = Settings.llm.complete(prompt)
         return response.text.strip()
+
+    async def _synthesize_stream(
+        self, query: str, nodes: list[NodeWithScore]
+    ) -> AsyncGenerator[str, None]:
+        """Streaming variant of _synthesize — yields tokens as they arrive."""
+        prompt = self._build_synthesis_prompt(query, nodes)
+        async for chunk in await Settings.llm.astream_complete(prompt):
+            if chunk.delta:
+                yield chunk.delta
+
+    async def aplan_query(self, query: str) -> dict:
+        """Async wrapper for _plan_query — runs in a thread pool to avoid blocking the event loop."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._plan_query, query)
 
     # ------------------------------------------------------------------
     # LlamaIndex-compatible interface

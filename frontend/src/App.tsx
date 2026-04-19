@@ -1,14 +1,17 @@
 import { useState } from 'react';
 import { useQuery } from './hooks/useQuery';
 import { ChatInput } from './components/ChatInput';
+import { DataQualityBadge } from './components/DataQualityBadge';
+import { FeedbackBar } from './components/FeedbackBar';
 import { NodesSidebar } from './components/NodesSidebar';
 import { StreamingAnswer } from './components/StreamingAnswer';
 import { SourceChips } from './components/SourceChips';
 
 export default function App() {
-  const { nodes, answer, sources, isStreaming, error, submitQuery } = useQuery();
+  const { nodes, answer, sources, dataQuality, isStreaming, error, submitQuery } = useQuery();
   const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(new Set());
   const [scrollTargetId, setScrollTargetId] = useState<string | null>(null);
+  const [currentQuery, setCurrentQuery] = useState<string | null>(null);
 
   function activateNode(nodeId: string) {
     setExpandedNodeIds((prev) => {
@@ -26,6 +29,7 @@ export default function App() {
   function handleSubmit(query: string) {
     setExpandedNodeIds(new Set());
     setScrollTargetId(null);
+    setCurrentQuery(query);
     submitQuery(query);
   }
 
@@ -41,6 +45,12 @@ export default function App() {
       <div className="flex flex-1 overflow-hidden">
         {/* Left: answer + sources */}
         <div className="flex flex-col flex-1 overflow-hidden">
+          {currentQuery && (
+            <div className="px-6 pt-5 pb-3 shrink-0">
+              <p className="text-[10px] uppercase tracking-wider text-slate-400 mb-1">Question</p>
+              <p className="text-base font-medium text-slate-800">{currentQuery}</p>
+            </div>
+          )}
           {error ? (
             <div className="flex-1 flex items-center justify-center px-6">
               <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-red-700 text-sm max-w-lg">
@@ -51,9 +61,23 @@ export default function App() {
             <StreamingAnswer answer={answer} isStreaming={isStreaming} />
           )}
 
+          {/* DataQualityBadge hidden — re-enable once confidence calibration is improved
+          {dataQuality && !isStreaming && (
+            <DataQualityBadge quality={dataQuality} />
+          )}
+          */}
+
           <div className="shrink-0">
             <SourceChips sources={sources} onActivate={activateNode} expandedNodeIds={expandedNodeIds} />
           </div>
+
+          <FeedbackBar
+            query={currentQuery ?? ''}
+            answer={answer}
+            sources={sources}
+            dataQuality={dataQuality}
+            isStreaming={isStreaming}
+          />
         </div>
 
         {/* Right: nodes sidebar */}

@@ -1,0 +1,9 @@
+You are a financial analyst. Answer the question below using only the provided SEC filing excerpts.
+Be specific, cite the company and fiscal year where relevant, and be concise.
+
+Question: {query}
+
+SEC Filing Excerpts:
+{context}
+
+Answer:

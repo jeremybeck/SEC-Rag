@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react';
-import type { NodeData, SourceData, SSEEvent } from '../types';
+import type { NodeData, SourceData, DataQualityAssessment, SSEEvent } from '../types';
 
 const API_URL = 'http://localhost:8000/query';
 
@@ -7,6 +7,7 @@ export function useQuery() {
   const [nodes, setNodes] = useState<NodeData[]>([]);
   const [answer, setAnswer] = useState('');
   const [sources, setSources] = useState<SourceData[]>([]);
+  const [dataQuality, setDataQuality] = useState<DataQualityAssessment | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -18,6 +19,7 @@ export function useQuery() {
     setNodes([]);
     setAnswer('');
     setSources([]);
+    setDataQuality(null);
     setError(null);
     answerRef.current = '';
     setIsStreaming(true);
@@ -69,6 +71,9 @@ export function useQuery() {
               answerRef.current += event.data;
               setAnswer(answerRef.current);
               break;
+            case 'quality':
+              setDataQuality(event.data);
+              break;
             case 'sources':
               setSources(event.data);
               break;
@@ -87,5 +92,5 @@ export function useQuery() {
     }
   }
 
-  return { nodes, answer, sources, isStreaming, error, submitQuery };
+  return { nodes, answer, sources, dataQuality, isStreaming, error, submitQuery };
 }

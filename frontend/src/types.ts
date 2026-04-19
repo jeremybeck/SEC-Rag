@@ -15,11 +15,20 @@ export interface SourceData {
   fiscal_year: number;
   section_label: string;
   node_id: string;
+  citation_indices: number[];
+  quote: string;
+}
+
+export interface DataQualityAssessment {
+  rating: 'HIGH' | 'MEDIUM' | 'LOW';
+  summary: string;
+  missing_coverage: string[];
 }
 
 export type SSEEvent =
-  | { type: 'nodes'; data: NodeData[] }
-  | { type: 'token'; data: string }
+  | { type: 'nodes';   data: NodeData[] }
+  | { type: 'token';   data: string }
+  | { type: 'quality'; data: DataQualityAssessment }
   | { type: 'sources'; data: SourceData[] }
   | { type: 'done' }
-  | { type: 'error'; data: string };
+  | { type: 'error';   data: string };

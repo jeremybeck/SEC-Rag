@@ -36,17 +36,25 @@ export function SourceChips({ sources, onActivate, expandedNodeIds }: Props) {
           const active = expandedNodeIds.has(s.node_id);
           const colors = tickerColor(s.ticker);
           return (
-            <button
-              key={s.node_id}
-              onClick={() => onActivate(s.node_id)}
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium border cursor-pointer transition-colors ${active ? colors.active : colors.inactive}`}
-            >
-              <span className="font-semibold">{s.ticker}</span>
-              <span className={active ? 'opacity-90' : 'opacity-70'}>{s.filing_type}</span>
-              <span className={active ? 'opacity-90' : 'opacity-70'}>FY{s.fiscal_year}</span>
-              <span className={active ? 'opacity-60' : 'opacity-40'}>·</span>
-              <span className={`max-w-[120px] truncate ${active ? 'opacity-90' : 'opacity-70'}`}>{s.section_label}</span>
-            </button>
+            <div key={s.node_id} className="relative group">
+              <button
+                onClick={() => onActivate(s.node_id)}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium border cursor-pointer transition-colors ${active ? colors.active : colors.inactive}`}
+              >
+                <span className={`font-mono text-[10px] ${active ? 'opacity-90' : 'opacity-50'}`}>[{s.citation_index}]</span>
+                <span className="font-semibold">{s.ticker}</span>
+                <span className={active ? 'opacity-90' : 'opacity-70'}>{s.filing_type}</span>
+                <span className={active ? 'opacity-90' : 'opacity-70'}>FY{s.fiscal_year}</span>
+                <span className={active ? 'opacity-60' : 'opacity-40'}>·</span>
+                <span className={`max-w-[120px] truncate ${active ? 'opacity-90' : 'opacity-70'}`}>{s.section_label}</span>
+              </button>
+
+              {s.quote && (
+                <div className="absolute bottom-full left-0 mb-2 w-80 bg-slate-800 text-slate-100 text-xs leading-relaxed rounded-lg p-3 shadow-xl z-50 pointer-events-none opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-opacity duration-150">
+                  <span className="opacity-50">...</span>{s.quote}<span className="opacity-50">...</span>
+                </div>
+              )}
+            </div>
           );
         })}
       </div>

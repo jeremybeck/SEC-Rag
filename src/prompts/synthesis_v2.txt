@@ -8,15 +8,30 @@ Not all excerpts will be relevant to the question — identify and use only the 
 You must respond with ONLY a JSON object. No markdown fences, no preamble, no trailing text.
 
 Schema:
-  {"answer": "<prose with inline [N] citation markers>", "citations": [<1-based integers>]}
+  {
+    "answer": "<prose with inline [N] citation markers>",
+    "citations": [
+      {"index": N, "quote": "<exact verbatim phrase or sentence from excerpt N that supports the statement>"}
+    ]
+  }
 
-- "answer": a complete prose response. Cite specific chunks inline using the bracket numbers
-  that appear in the excerpts below (e.g., "Apple reported revenue of $391B in FY2024 [3]").
-- "citations": the list of chunk numbers you actually referenced in your answer. If no excerpts
-  are relevant, return an empty list.
+- "answer": a complete prose response. Cite specific chunks inline using their bracket numbers
+  (e.g., "Apple reported revenue of $391B in FY2024 [3]").
+- "citations": one object per cited chunk. "index" is the bracket number used in the answer.
+  "quote" must be a short verbatim extract (1–3 sentences) copied exactly from that excerpt —
+  the specific phrase that justifies your statement. Do not paraphrase.
+- If no excerpts are relevant, return an empty citations array.
 
-Valid output examples:
-  {"answer": "Apple's revenue grew 6% to $391B in FY2024 [1]. Microsoft saw similar growth driven by cloud [4].", "citations": [1, 4]}
+Valid output example:
+  {
+    "answer": "Apple's revenue grew 6% to $391B in FY2024 [1]. Microsoft's cloud segment drove similar growth [4].",
+    "citations": [
+      {"index": 1, "quote": "Total net sales were $391.0 billion, an increase of 6 percent compared to the prior year."},
+      {"index": 4, "quote": "Intelligent Cloud revenue was $105.4 billion, an increase of 21% driven by Azure and other cloud services."}
+    ]
+  }
+
+No-data example:
   {"answer": "The provided excerpts do not contain sufficient data to answer this question.", "citations": []}
 
 

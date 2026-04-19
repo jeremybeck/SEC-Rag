@@ -17,6 +17,7 @@ Basic usage:
 
 import asyncio
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import AsyncGenerator
@@ -32,10 +33,16 @@ from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from pydantic import BaseModel
 
 
+class Citation(BaseModel):
+    """A single citation: the chunk index and the verbatim quote from that chunk."""
+    index: int
+    quote: str
+
+
 class SynthesisResponse(BaseModel):
     """Structured output schema for the synthesis LLM call."""
     answer:    str
-    citations: list[int]
+    citations: list[Citation]
 
 
 class SecQueryEngine:
@@ -253,15 +260,20 @@ class SecQueryEngine:
         for i, n in enumerate(nodes, 1):
             context_parts.append(f"[{i}]\n{n.node.get_content()}")
         context = "\n\n---\n\n".join(context_parts)
-        return self._prompt_template.format(query=query, context=context)
+        return (
+            self._prompt_template
+            .replace("{query}", query)
+            .replace("{context}", context)
+        )
 
-    def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> tuple[str, list[str]]:
+    def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> tuple[str, list[str], list[str]]:
         """
-        Single LLM call via structured_predict — returns (answer_text, cited_node_ids).
+        Single LLM call via structured_predict.
+        Returns (answer_text, cited_node_ids, cited_quotes).
 
-        Uses LlamaIndex's structured_predict with the SynthesisResponse Pydantic model,
-        which routes through OpenAI's function-calling API and guarantees the output
-        matches the schema (answer: str, citations: list[int]).
+        citation indices in the answer are renumbered 1-based by first appearance.
+        cited_quotes contains the verbatim excerpt the LLM pulled for each citation,
+        in the same order as cited_node_ids.
         """
         prompt = self._build_synthesis_prompt(query, nodes)
         try:
@@ -270,16 +282,34 @@ class SecQueryEngine:
                 PromptTemplate("{prompt_str}"),
                 prompt_str=prompt,
             )
-            cited_node_ids = [
-                nodes[i - 1].node_id
-                for i in result.citations
-                if isinstance(i, int) and 1 <= i <= len(nodes)
-            ]
-            return result.answer, cited_node_ids
+            # Build quote lookup keyed by original chunk index
+            quote_map: dict[int, str] = {c.index: c.quote for c in result.citations}
+
+            # Collect original citation indices in order of first appearance in answer text
+            seen: list[int] = []
+            for m in re.finditer(r'\[(\d+)\]', result.answer):
+                idx = int(m.group(1))
+                if idx not in seen and 1 <= idx <= len(nodes):
+                    seen.append(idx)
+            # Append any cited but not mentioned inline
+            for c in result.citations:
+                if isinstance(c.index, int) and c.index not in seen and 1 <= c.index <= len(nodes):
+                    seen.append(c.index)
+
+            # Renumber [N] → [1], [2], ... by first-appearance order
+            remap = {orig: disp for disp, orig in enumerate(seen, 1)}
+            answer = re.sub(
+                r'\[(\d+)\]',
+                lambda m: f"[{remap[int(m.group(1))]}]" if int(m.group(1)) in remap else m.group(0),
+                result.answer,
+            )
+            cited_node_ids = [nodes[orig - 1].node_id for orig in seen]
+            cited_quotes   = [quote_map.get(orig, "") for orig in seen]
+            return answer, cited_node_ids, cited_quotes
         except Exception as e:
             print(f"[SecQueryEngine] WARNING: structured_predict failed ({e}) — falling back to plain complete")
             response = Settings.llm.complete(prompt)
-            return response.text.strip(), []
+            return response.text.strip(), [], []
 
     # NOTE: no longer called by the server; retained for potential direct use.
     async def _synthesize_stream(
@@ -346,5 +376,5 @@ class _DynamicSecQueryEngine(BaseQueryEngine):
         nodes = await self._sec._retrieve_nodes(query_str)
         if self._sec.verbose:
             print(f"[Nodes retrieved] {len(nodes)}")
-        answer, _ = self._sec._synthesize(query_str, nodes)
+        answer, _, _ = self._sec._synthesize(query_str, nodes)
         return Response(response=answer)

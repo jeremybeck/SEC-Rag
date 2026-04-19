@@ -15,6 +15,8 @@ export interface SourceData {
   fiscal_year: number;
   section_label: string;
   node_id: string;
+  citation_index: number;
+  quote: string;
 }
 
 export type SSEEvent =

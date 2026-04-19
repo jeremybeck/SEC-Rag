@@ -89,12 +89,14 @@ async def query_endpoint(request: Request, body: QueryRequest):
                 })
             yield _event({"type": "nodes", "data": nodes_payload})
 
-            # Stage 3: Synthesize answer (single LLM call; returns cited node IDs)
-            answer, cited_node_ids = engine._synthesize(query, nodes)
+            # Stage 3: Synthesize answer (single LLM call; returns cited node IDs + quotes)
+            answer, cited_node_ids, cited_quotes = engine._synthesize(query, nodes)
             yield _event({"type": "token", "data": answer})
 
-            # Stage 4: Sources — only nodes actually cited in the answer
+            # Stage 4: Sources — only nodes actually cited, with 1-based display index and verbatim quote
             cited_set = set(cited_node_ids)
+            node_id_to_citation_index = {nid: i + 1 for i, nid in enumerate(cited_node_ids)}
+            node_id_to_quote = dict(zip(cited_node_ids, cited_quotes))
             seen_sources = set()
             sources = []
             for n in nodes:
@@ -105,11 +107,13 @@ async def query_endpoint(request: Request, body: QueryRequest):
                 if key not in seen_sources:
                     seen_sources.add(key)
                     sources.append({
-                        "ticker":        m.get("ticker"),
-                        "filing_type":   m.get("filing_type"),
-                        "fiscal_year":   m.get("fiscal_year"),
-                        "section_label": m.get("section_label"),
-                        "node_id":       n.node_id,
+                        "ticker":          m.get("ticker"),
+                        "filing_type":     m.get("filing_type"),
+                        "fiscal_year":     m.get("fiscal_year"),
+                        "section_label":   m.get("section_label"),
+                        "node_id":         n.node_id,
+                        "citation_index":  node_id_to_citation_index[n.node_id],
+                        "quote":           node_id_to_quote.get(n.node_id, ""),
                     })
             yield _event({"type": "sources", "data": sources})
 

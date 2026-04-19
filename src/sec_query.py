@@ -18,6 +18,7 @@ Basic usage:
 import asyncio
 import math
 from collections import defaultdict
+from pathlib import Path
 from typing import AsyncGenerator
 
 from llama_index.core import VectorStoreIndex, Settings
@@ -52,6 +53,8 @@ class SecQueryEngine:
         Maximum chunks passed to the synthesis LLM (default 20).
     """
 
+    _PROMPTS_DIR = Path(__file__).parent / "prompts"
+
     def __init__(
         self,
         index:               VectorStoreIndex,
@@ -63,6 +66,7 @@ class SecQueryEngine:
         max_synthesis_nodes: int   = 50,
         mmr_lambda:          float = 0.5,
         mmr_soft_cap:        int   = 5,
+        prompt_file:         str   = "synthesis_v1.txt",
     ):
         self.index                = index
         self.top_k                = top_k
@@ -72,6 +76,7 @@ class SecQueryEngine:
         self._rerank_per_ticker   = rerank_per_ticker
         self._mmr_lambda          = mmr_lambda
         self._mmr_soft_cap        = mmr_soft_cap
+        self._prompt_template     = (self._PROMPTS_DIR / prompt_file).read_text()
 
         if debug:
             self._debug_handler = LlamaDebugHandler(print_trace_on_end=True)
@@ -240,16 +245,7 @@ class SecQueryEngine:
         for i, n in enumerate(nodes, 1):
             context_parts.append(f"[{i}]\n{n.node.get_content()}")
         context = "\n\n---\n\n".join(context_parts)
-
-        return f"""You are a financial analyst. Answer the question below using only the provided SEC filing excerpts.
-Be specific, cite the company and fiscal year where relevant, and be concise.
-
-Question: {query}
-
-SEC Filing Excerpts:
-{context}
-
-Answer:"""
+        return self._prompt_template.format(query=query, context=context)
 
     def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> str:
         """Single LLM call to produce a final answer from retrieved nodes."""

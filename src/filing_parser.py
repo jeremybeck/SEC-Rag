@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from llama_index.core import Document
-from llama_index.core.node_parser import TokenTextSplitter
+from llama_index.core.node_parser import SentenceSplitter
 
 # =========================================================
 # FILENAME PARSING
@@ -113,23 +113,65 @@ def load_file(filepath: Path) -> tuple[str, FilingInfo]:
 # SEC SECTION SPLITTER
 # =========================================================
 
+_SECTION_START_RE = re.compile(r"(ITEM\s+(\d+)[A-C]?)", re.IGNORECASE)
+_CROSS_REF_SIGNALS = re.compile(
+    r"\b(see|see also|pursuant to|discussed in|refer to|described in|"
+    r"in accordance with|as defined in|set forth in)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_cross_reference(text_before: str) -> bool:
+    snippet = text_before[-80:].strip()
+    return bool(_CROSS_REF_SIGNALS.search(snippet))
+
+
 def split_by_sec_items(text: str) -> list[tuple[str, str]]:
-    pattern = r"(ITEM\s+\d+[A-Z]?)"
+    # B2: Normalize whitespace/unicode without destroying paragraph structure
+    text = re.sub(r"\n{3,}", "\n\n", text)   # collapse excessive blank lines
+    text = re.sub(r"\xa0+", " ", text)        # normalize NBSP
+    text = re.sub(r" {3,}", " ", text)        # collapse padding spaces
 
-    text = text.replace("\n", " ")
-    parts = re.split(pattern, text, flags=re.IGNORECASE)
-
+    # Find all ITEM N / ITEM NA matches and their positions
+    matches = list(_SECTION_START_RE.finditer(text))
     sections = []
 
-    i = 1
-    while i < len(parts) - 1:
-        header = parts[i].strip().upper()
-        body = parts[i + 1].strip()
+    for idx, match in enumerate(matches):
+        item_num_str = match.group(2)
+        try:
+            item_num = int(item_num_str)
+        except ValueError:
+            continue
 
+        # B1: Skip exhibit/regulation item numbers > 20
+        if item_num > 20:
+            continue
+
+        # B1: Skip cross-reference occurrences (e.g. "see Item 1A", "pursuant to Item 601")
+        if _is_cross_reference(text[: match.start()]):
+            continue
+
+        header = match.group(1).strip().upper()
+
+        # Body runs from end of this match to start of the next accepted match
+        body_start = match.end()
+        body_end = len(text)
+        for later in matches[idx + 1:]:
+            later_num_str = later.group(2)
+            try:
+                later_num = int(later_num_str)
+            except ValueError:
+                continue
+            if later_num > 20:
+                continue
+            if _is_cross_reference(text[: later.start()]):
+                continue
+            body_end = later.start()
+            break
+
+        body = text[body_start:body_end].strip()
         if len(body) > 1000:
             sections.append((header, body))
-
-        i += 2
 
     return sections
 
@@ -138,20 +180,85 @@ def split_by_sec_items(text: str) -> list[tuple[str, str]]:
 # SECTION LABELS
 # =========================================================
 
-SEC_LABELS = {
-    "ITEM 1": "BUSINESS",
+_SEC_LABELS_10K: dict[str, str] = {
+    "ITEM 1":  "BUSINESS",
     "ITEM 1A": "RISK FACTORS",
     "ITEM 1B": "UNRESOLVED STAFF COMMENTS",
-    "ITEM 7": "MD&A",
+    "ITEM 1C": "CYBERSECURITY",
+    "ITEM 2":  "PROPERTIES",
+    "ITEM 3":  "LEGAL PROCEEDINGS",
+    "ITEM 4":  "MINE SAFETY DISCLOSURES",
+    "ITEM 5":  "MARKET FOR COMMON EQUITY",
+    "ITEM 6":  "SELECTED FINANCIAL DATA",
+    "ITEM 7":  "MD&A",
     "ITEM 7A": "MARKET RISK",
-    "ITEM 8": "FINANCIAL STATEMENTS",
+    "ITEM 8":  "FINANCIAL STATEMENTS",
+    "ITEM 9":  "ACCOUNTANT CHANGES",
+    "ITEM 9A": "CONTROLS AND PROCEDURES",
+    "ITEM 9B": "OTHER INFORMATION",
+    "ITEM 10": "DIRECTORS AND GOVERNANCE",
+    "ITEM 11": "EXECUTIVE COMPENSATION",
+    "ITEM 12": "SECURITY OWNERSHIP",
+    "ITEM 13": "RELATED TRANSACTIONS",
+    "ITEM 14": "ACCOUNTANT FEES",
+    "ITEM 15": "EXHIBITS",
+}
+
+_SEC_LABELS_10Q: dict[str, str] = {
+    "ITEM 1":  "FINANCIAL STATEMENTS",
+    "ITEM 2":  "MD&A",
+    "ITEM 3":  "MARKET RISK",
+    "ITEM 4":  "CONTROLS AND PROCEDURES",
+    "ITEM 5":  "OTHER INFORMATION",
+    "ITEM 6":  "EXHIBITS",
+}
+
+# Keep a legacy alias so external callers that import SEC_LABELS still work
+SEC_LABELS = _SEC_LABELS_10K
+
+
+def format_section_header(item_code: str, filing_type: str = "10-K") -> str:
+    item_code = item_code.upper().strip()
+    label_map = _SEC_LABELS_10Q if "10-Q" in filing_type.upper() else _SEC_LABELS_10K
+    label = label_map.get(item_code, item_code)
+    return f"{label} ({item_code})"
+
+
+# =========================================================
+# COMPANY NAMES — used to enrich chunk text for semantic search
+# =========================================================
+
+TICKER_NAMES: dict[str, str] = {
+    "AAPL": "Apple",             "MSFT": "Microsoft",        "NVDA": "NVIDIA",
+    "AMZN": "Amazon",            "GOOG": "Alphabet",         "META": "Meta",
+    "AMD":  "AMD",               "INTC": "Intel",            "CRM":  "Salesforce",
+    "ADBE": "Adobe",             "ORCL": "Oracle",           "CSCO": "Cisco",
+    "IBM":  "IBM",               "TSLA": "Tesla",            "JPM":  "JPMorgan Chase",
+    "BAC":  "Bank of America",   "GS":   "Goldman Sachs",    "MS":   "Morgan Stanley",
+    "AXP":  "American Express",  "BLK":  "BlackRock",        "BRK":  "Berkshire Hathaway",
+    "V":    "Visa",              "MA":   "Mastercard",       "JNJ":  "Johnson & Johnson",
+    "PFE":  "Pfizer",            "MRK":  "Merck",            "LLY":  "Eli Lilly",
+    "ABBV": "AbbVie",            "UNH":  "UnitedHealth",     "TMO":  "Thermo Fisher",
+    "XOM":  "ExxonMobil",        "CVX":  "Chevron",          "KO":   "Coca-Cola",
+    "PEP":  "PepsiCo",           "WMT":  "Walmart",          "COST": "Costco",
+    "TGT":  "Target",            "PG":   "Procter & Gamble", "NKE":  "Nike",
+    "MCD":  "McDonald's",        "SBUX": "Starbucks",        "DIS":  "Disney",
+    "NFLX": "Netflix",           "CMCSA":"Comcast",          "T":    "AT&T",
+    "VZ":   "Verizon",           "BA":   "Boeing",           "CAT":  "Caterpillar",
+    "LMT":  "Lockheed Martin",   "RTX":  "RTX",              "DE":   "Deere & Company",
+    "UPS":  "UPS",               "HD":   "Home Depot",       "GE":   "GE",
 }
 
 
-def format_section_header(item_code: str) -> str:
-    item_code = item_code.upper().strip()
-    label = SEC_LABELS.get(item_code, "UNKNOWN SECTION")
-    return f"{label} ({item_code})"
+def _chunk_prefix(info: "FilingInfo", section_label: str) -> str:
+    """Build a self-describing text prefix that gives the embedding model full context."""
+    company = TICKER_NAMES.get(info.ticker, info.ticker)
+    filing_label = "Annual Report" if "10-K" in info.filing_type else "Quarterly Report"
+    if info.fiscal_quarter:
+        period = f"FY{info.fiscal_year} Q{info.fiscal_quarter}"
+    else:
+        period = f"FY{info.fiscal_year}"
+    return f"{company} ({info.ticker}) | {info.filing_type} {filing_label} | {period} | {section_label}"
 
 
 # =========================================================
@@ -161,12 +268,16 @@ def format_section_header(item_code: str) -> str:
 def build_all_documents(
     file_list: list[str],
     corpus_dir: Path,
-    chunk_size: int = 1200,
-    chunk_overlap: int = 150,
+    chunk_size: int = 800,
+    chunk_overlap: int = 200,
 ) -> list[Document]:
     all_docs = []
 
-    splitter = TokenTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    splitter = SentenceSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        paragraph_separator="\n\n",
+    )
 
     for fname in file_list:
         filepath = corpus_dir / fname
@@ -175,12 +286,13 @@ def build_all_documents(
 
         for section_code, section_text in sections:
             chunks = splitter.split_text(section_text)
-            pretty_header = format_section_header(section_code)
+            section_label = format_section_header(section_code, info.filing_type)
+            prefix = _chunk_prefix(info, section_label)
 
             for i, chunk in enumerate(chunks):
                 all_docs.append(
                     Document(
-                        text=f"{pretty_header}\n\n{chunk}",
+                        text=f"{prefix}\n\n{chunk}",
                         metadata={
                             "ticker": info.ticker,
                             "filing_type": info.filing_type,
@@ -189,7 +301,7 @@ def build_all_documents(
                             "filing_date": info.filing_date,
                             "inferred": info.inferred,
                             "section_code": section_code,
-                            "section_label": pretty_header,
+                            "section_label": section_label,
                             "chunk_id": i,
                             "file": info.filename,
                         },

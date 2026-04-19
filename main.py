@@ -12,18 +12,15 @@ from llama_index.llms.openai import OpenAI
 from index_loader import load_index
 from sec_query import SecQueryEngine
 
-MANIFEST_PATH = Path("files/edgar_corpus/manifest.json")
-
-
 async def main():
-    Settings.embed_model = OpenAIEmbedding()
+    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
     Settings.llm = OpenAI(model="gpt-4o")
 
     print("Loading index...")
     index = load_index()
     print("Index loaded.")
 
-    engine = SecQueryEngine(index=index, manifest_path=str(MANIFEST_PATH))
+    engine = SecQueryEngine(index=index)
     response = await engine.query("What risks did Amazon cite in Q1 and Q2 of 2022?")
     print(response)
 

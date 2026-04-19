@@ -1,157 +1,77 @@
 """
-sec_query.py
-------------
-Dynamic query planning and retrieval for SEC EDGAR filings
-using LlamaIndex + OpenAI.
+sec_query.py — Single-LLM-call RAG engine for SEC EDGAR filings.
 
-Pipeline (2 LLM calls total):
-  1. _plan_query  — one LLM call before retrieval to resolve tickers/years/types
-  2. _retrieve_nodes — pure vector retrieval, no LLM
-  3. _synthesize  — one LLM call after retrieval to produce the final answer
+Pipeline (1 LLM call total):
+  1. _retrieve_nodes — dense vector retrieval via pgvector ANN (no LLM)
+  2. _synthesize_stream — single LLM call to answer the question from retrieved context
+
+Chunk enrichment (not metadata filters) drives retrieval precision.
+Each indexed chunk starts with a self-describing header:
+    "Apple (AAPL) | 10-K Annual Report | FY2024 | RISK FACTORS (ITEM 1A)"
+so cosine similarity alone routes queries to the right documents.
 
 Basic usage:
-    from sec_query import SecQueryEngine
-
-    engine = SecQueryEngine(
-        index=my_existing_index,
-        manifest_path="manifest.json",
-    )
-
-    # Option 1: call directly (async)
-    response = await engine.query("What did pharma companies say about drug pricing in 2024?")
-    print(response)
-
-    # Option 2: use as a standard LlamaIndex query engine
-    #   — works with agents, pipelines, RouterQueryEngine, etc.
-    query_engine = engine.as_query_engine()
-    response = await query_engine.aquery("Compare AAPL and MSFT margins in 2024")
-    print(response)
-
-    # Option 3: wrap as a tool for an agent or RouterQueryEngine
-    tool = engine.as_tool(
-        name="sec_filings",
-        description="Query SEC 10-K and 10-Q filings across all companies and years."
-    )
+    engine = SecQueryEngine(index=my_index)
+    response = await engine.query("What risks did Apple cite in 2024?")
 """
 
 import asyncio
-import json
-import re
-from datetime import date
-from typing import AsyncGenerator, Optional
+import math
+from collections import defaultdict
+from typing import AsyncGenerator
 
-from llama_index.core import VectorStoreIndex
+from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.base.base_query_engine import BaseQueryEngine
 from llama_index.core.base.response.schema import RESPONSE_TYPE, Response
 from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler
+from llama_index.core.postprocessor import SentenceTransformerRerank, SimilarityPostprocessor
 from llama_index.core.schema import QueryBundle, NodeWithScore
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
-from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, FilterOperator
-from llama_index.core import Settings
-
-from filing_parser import FilingInfo, parse_filing_filename
 
 
-# ---------------------------------------------------------------------------
-# Ticker metadata — company name, sector, industry
-# Extend this dict with any additional tickers in your corpus
-# ---------------------------------------------------------------------------
-TICKER_METADATA: dict[str, dict] = {
-    "AAPL":  {"name": "Apple",             "sector": "Technology",       "industry": "Consumer Electronics"},
-    "MSFT":  {"name": "Microsoft",         "sector": "Technology",       "industry": "Software"},
-    "NVDA":  {"name": "NVIDIA",            "sector": "Technology",       "industry": "Semiconductors"},
-    "AMZN":  {"name": "Amazon",            "sector": "Technology",       "industry": "E-Commerce / Cloud"},
-    "GOOG":  {"name": "Alphabet",          "sector": "Technology",       "industry": "Internet / Advertising"},
-    "META":  {"name": "Meta",              "sector": "Technology",       "industry": "Social Media"},
-    "AMD":   {"name": "AMD",               "sector": "Technology",       "industry": "Semiconductors"},
-    "INTC":  {"name": "Intel",             "sector": "Technology",       "industry": "Semiconductors"},
-    "CRM":   {"name": "Salesforce",        "sector": "Technology",       "industry": "Software"},
-    "ADBE":  {"name": "Adobe",             "sector": "Technology",       "industry": "Software"},
-    "ORCL":  {"name": "Oracle",            "sector": "Technology",       "industry": "Software"},
-    "CSCO":  {"name": "Cisco",             "sector": "Technology",       "industry": "Networking"},
-    "IBM":   {"name": "IBM",               "sector": "Technology",       "industry": "IT Services"},
-    "TSLA":  {"name": "Tesla",             "sector": "Consumer",         "industry": "Electric Vehicles"},
-    "JPM":   {"name": "JPMorgan Chase",    "sector": "Financials",       "industry": "Banking"},
-    "BAC":   {"name": "Bank of America",   "sector": "Financials",       "industry": "Banking"},
-    "GS":    {"name": "Goldman Sachs",     "sector": "Financials",       "industry": "Investment Banking"},
-    "MS":    {"name": "Morgan Stanley",    "sector": "Financials",       "industry": "Investment Banking"},
-    "AXP":   {"name": "American Express",  "sector": "Financials",       "industry": "Payments"},
-    "BLK":   {"name": "BlackRock",         "sector": "Financials",       "industry": "Asset Management"},
-    "BRK":   {"name": "Berkshire Hathaway","sector": "Financials",       "industry": "Conglomerate"},
-    "V":     {"name": "Visa",              "sector": "Financials",       "industry": "Payments"},
-    "MA":    {"name": "Mastercard",        "sector": "Financials",       "industry": "Payments"},
-    "JNJ":   {"name": "Johnson & Johnson", "sector": "Healthcare",       "industry": "Pharmaceuticals"},
-    "PFE":   {"name": "Pfizer",            "sector": "Healthcare",       "industry": "Pharmaceuticals"},
-    "MRK":   {"name": "Merck",             "sector": "Healthcare",       "industry": "Pharmaceuticals"},
-    "LLY":   {"name": "Eli Lilly",         "sector": "Healthcare",       "industry": "Pharmaceuticals"},
-    "ABBV":  {"name": "AbbVie",            "sector": "Healthcare",       "industry": "Pharmaceuticals"},
-    "UNH":   {"name": "UnitedHealth",      "sector": "Healthcare",       "industry": "Health Insurance"},
-    "TMO":   {"name": "Thermo Fisher",     "sector": "Healthcare",       "industry": "Life Sciences"},
-    "XOM":   {"name": "ExxonMobil",        "sector": "Energy",           "industry": "Oil & Gas"},
-    "CVX":   {"name": "Chevron",           "sector": "Energy",           "industry": "Oil & Gas"},
-    "KO":    {"name": "Coca-Cola",         "sector": "Consumer Staples", "industry": "Beverages"},
-    "PEP":   {"name": "PepsiCo",           "sector": "Consumer Staples", "industry": "Beverages"},
-    "WMT":   {"name": "Walmart",           "sector": "Consumer Staples", "industry": "Retail"},
-    "COST":  {"name": "Costco",            "sector": "Consumer Staples", "industry": "Retail"},
-    "TGT":   {"name": "Target",            "sector": "Consumer Staples", "industry": "Retail"},
-    "PG":    {"name": "Procter & Gamble",  "sector": "Consumer Staples", "industry": "Household Products"},
-    "NKE":   {"name": "Nike",              "sector": "Consumer",         "industry": "Apparel & Footwear"},
-    "MCD":   {"name": "McDonald's",        "sector": "Consumer",         "industry": "Restaurants"},
-    "SBUX":  {"name": "Starbucks",         "sector": "Consumer",         "industry": "Restaurants"},
-    "DIS":   {"name": "Disney",            "sector": "Communication",    "industry": "Entertainment"},
-    "NFLX":  {"name": "Netflix",           "sector": "Communication",    "industry": "Streaming"},
-    "CMCSA": {"name": "Comcast",           "sector": "Communication",    "industry": "Telecom / Media"},
-    "T":     {"name": "AT&T",              "sector": "Communication",    "industry": "Telecom"},
-    "VZ":    {"name": "Verizon",           "sector": "Communication",    "industry": "Telecom"},
-    "BA":    {"name": "Boeing",            "sector": "Industrials",      "industry": "Aerospace & Defense"},
-    "CAT":   {"name": "Caterpillar",       "sector": "Industrials",      "industry": "Heavy Equipment"},
-    "LMT":   {"name": "Lockheed Martin",   "sector": "Industrials",      "industry": "Aerospace & Defense"},
-    "RTX":   {"name": "RTX",               "sector": "Industrials",      "industry": "Aerospace & Defense"},
-    "DE":    {"name": "Deere & Company",   "sector": "Industrials",      "industry": "Heavy Equipment"},
-    "UPS":   {"name": "UPS",               "sector": "Industrials",      "industry": "Logistics"},
-    "HD":    {"name": "Home Depot",        "sector": "Consumer",         "industry": "Home Improvement Retail"},
-    "GE":    {"name": "GE",                "sector": "Industrials",      "industry": "Conglomerate"},
-}
-
-
-# ---------------------------------------------------------------------------
-# Main engine class
-# ---------------------------------------------------------------------------
 class SecQueryEngine:
     """
-    Dynamic SEC filings query engine.
+    RAG engine for SEC filings using a single LLM call.
 
-    Parses a manifest.json at startup to understand corpus coverage,
-    then for each query:
-      1. Plans which tickers / years / filing types are needed (one LLM call)
-      2. Retrieves nodes from the vector store using metadata filters (no LLM)
-      3. Synthesizes a final answer from all retrieved nodes (one LLM call)
+    Retrieval is driven by chunk enrichment: each chunk's text starts with
+    a structured header (company, filing type, fiscal year, section) so that
+    semantic similarity alone finds the right passages — no metadata filters,
+    no planning LLM call required.
 
     Parameters
     ----------
     index : VectorStoreIndex
-        Your pre-built LlamaIndex vector store.
-    manifest_path : str
-        Path to manifest.json describing the corpus.
+        Your pre-built LlamaIndex vector store (from pgvector).
     top_k : int
-        Number of chunks to retrieve per (ticker, year, filing_type) combination (default 6).
+        Candidates to fetch from ANN search before reranking (default 50).
     verbose : bool
-        Print query plan and retrieval summary (default True).
+        Print retrieval summary (default True).
     debug : bool
         Attach LlamaDebugHandler for detailed tracing (default False).
+    max_synthesis_nodes : int
+        Maximum chunks passed to the synthesis LLM (default 20).
     """
 
     def __init__(
         self,
-        index:         VectorStoreIndex,
-        manifest_path: str,
-        top_k:         int  = 6,
-        verbose:       bool = True,
-        debug:         bool = False,
+        index:               VectorStoreIndex,
+        top_k:               int  = 2500,
+        verbose:             bool = True,
+        debug:               bool = False,
+        rerank_pool:         int   = 200,
+        rerank_per_ticker:   int   = 15,
+        max_synthesis_nodes: int   = 50,
+        mmr_lambda:          float = 0.5,
+        mmr_soft_cap:        int   = 5,
     ):
-        self.index   = index
-        self.top_k   = top_k
-        self.verbose = verbose
+        self.index                = index
+        self.top_k                = top_k
+        self.verbose              = verbose
+        self.max_synthesis_nodes  = max_synthesis_nodes
+        self._rerank_pool         = rerank_pool
+        self._rerank_per_ticker   = rerank_per_ticker
+        self._mmr_lambda          = mmr_lambda
+        self._mmr_soft_cap        = mmr_soft_cap
 
         if debug:
             self._debug_handler = LlamaDebugHandler(print_trace_on_end=True)
@@ -159,17 +79,17 @@ class SecQueryEngine:
         else:
             self._debug_handler = None
 
-        self._manifest      = self._load_manifest(manifest_path)
-        self.all_tickers    = sorted(set(m["ticker"]      for m in self._manifest))
-        self.all_years      = sorted(set(m["fiscal_year"] for m in self._manifest))
-        self._coverage      = self._build_coverage()
+        # Cross-encoder reranker (~22 MB download on first use)
+        # top_n matches max_synthesis_nodes so the reranker produces exactly the final set
+        self._reranker = SentenceTransformerRerank(
+            model="cross-encoder/ms-marco-MiniLM-L-6-v2",
+            top_n=max_synthesis_nodes,
+        )
+        # Drop nodes below cosine similarity 0.72 before reranking
+        self._sim_filter = SimilarityPostprocessor(similarity_cutoff=0.40)
 
         if self.verbose:
-            print(
-                f"[SecQueryEngine] Loaded manifest: "
-                f"{len(self.all_tickers)} tickers, "
-                f"years {min(self.all_years)}–{max(self.all_years)}"
-            )
+            print("[SecQueryEngine] Ready.")
 
     # ------------------------------------------------------------------
     # Public API
@@ -177,169 +97,148 @@ class SecQueryEngine:
 
     async def query(self, query: str) -> str:
         """Run a natural-language query against the SEC corpus."""
-        plan  = self._plan_query(query)                    # LLM call #1 (before retrieval)
-        nodes = await self._retrieve_nodes(query, plan)    # pure vector retrieval
-
+        nodes = await self._retrieve_nodes(query)
         if self.verbose:
-            print(f"\n[Plan]\n{json.dumps(plan, indent=2)}")
-            print(f"[Nodes retrieved] {len(nodes)}\n")
-
-        return self._synthesize(query, nodes)              # LLM call #2 (after retrieval)
-
-    def get_coverage(self, ticker: str) -> dict:
-        """Return years and filing types available for a given ticker."""
-        return self._coverage.get(ticker.upper(), {})
+            print(f"[SecQueryEngine] {len(nodes)} nodes after retrieval pipeline")
+        return self._synthesize(query, nodes)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _load_manifest(self, manifest_path: str) -> list[dict]:
-        with open(manifest_path) as f:
-            files = json.load(f)["files"]
-        manifest = []
-        skipped  = 0
-        for fname in files:
-            try:
-                info = parse_filing_filename(fname)
-                manifest.append({
-                    "ticker":         info.ticker,
-                    "filing_type":    info.filing_type,
-                    "fiscal_year":    info.fiscal_year,
-                    "fiscal_quarter": info.fiscal_quarter,
-                    "filename":       fname,
-                })
-            except ValueError:
-                skipped += 1
-        if skipped and self.verbose:
-            print(f"[SecQueryEngine] Warning: skipped {skipped} unparseable filenames")
-        return manifest
-
-    def _build_coverage(self) -> dict:
-        coverage = {}
-        for m in self._manifest:
-            t = m["ticker"]
-            if t not in coverage:
-                coverage[t] = {"years": set(), "types": set()}
-            coverage[t]["years"].add(m["fiscal_year"])
-            coverage[t]["types"].add(m["filing_type"])
-        return coverage
-
-    def _plan_query(self, query: str) -> dict:
+    async def _retrieve_nodes(self, query: str) -> list[NodeWithScore]:
         """
-        LLM call #1 (before retrieval): resolve tickers, years, and filing types.
-        Grounded against manifest coverage so it can't hallucinate missing data.
+        Dense vector retrieval — no metadata filters, no LLM calls.
+
+        Relies on chunk enrichment (company/year/section prefix in chunk text)
+        to surface relevant passages via cosine similarity.
         """
-        coverage_summary = {
-            ticker: {
-                "years": sorted(info["years"]),
-                "types": sorted(info["types"]),
-                **TICKER_METADATA.get(ticker, {}),
-            }
-            for ticker, info in self._coverage.items()
-        }
+        retriever = self.index.as_retriever(similarity_top_k=self.top_k)
+        nodes = await retriever.aretrieve(query)
 
-        prompt = f"""
-Today's date is {date.today().isoformat()}.
+        # Deduplicate by node_id
+        seen, unique = set(), []
+        for n in nodes:
+            if n.node_id not in seen:
+                seen.add(n.node_id)
+                unique.append(n)
+        nodes = unique
 
-You are a query planner for a SEC filings database.
-Here is EXACTLY what is available — do not reference anything outside this:
-{json.dumps(coverage_summary, indent=2)}
+        if self.verbose:
+            scores = [n.score for n in nodes if n.score is not None]
+            if scores:
+                print(
+                    f"[Retrieval] {len(nodes)} candidates  "
+                    f"score range: {min(scores):.4f}–{max(scores):.4f}  "
+                    f"mean: {sum(scores)/len(scores):.4f}"
+                )
+            else:
+                print(f"[Retrieval] {len(nodes)} candidates (no scores)")
 
-Given this query: "{query}"
+        # Drop off-topic nodes below similarity floor — skip if it would wipe everything
+        filtered = self._sim_filter.postprocess_nodes(nodes)
+        if filtered:
+            if self.verbose:
+                print(f"[SimFilter] {len(filtered)} nodes passed cutoff {self._sim_filter.similarity_cutoff}")
+            nodes = filtered
+        else:
+            if self.verbose:
+                print(f"[SimFilter] cutoff {self._sim_filter.similarity_cutoff} removed all nodes — skipping filter")
 
-Return a JSON query plan with this structure:
-{{
-  "tickers": ["AAPL", "MSFT"],
-  "years": [2023, 2024],
-  "filing_types": ["10-K"],
-  "reasoning": "brief explanation"
-}}
+        # Pre-rerank pool: guarantee each ticker gets at least rerank_per_ticker candidates,
+        # then fill remaining slots with the highest-cosine nodes from any ticker.
+        # Without this, a dominant company fills all slots and the cross-encoder never
+        # sees the other company's chunks.
+        nodes = sorted(nodes, key=lambda n: n.score or 0, reverse=True)
+        ticker_counts: dict[str, int] = defaultdict(int)
+        pool, remainder = [], []
+        for n in nodes:
+            ticker = n.node.metadata.get("ticker", "")
+            if ticker_counts[ticker] < self._rerank_per_ticker:
+                pool.append(n)
+                ticker_counts[ticker] += 1
+            else:
+                remainder.append(n)
+        for n in remainder:
+            if len(pool) >= self._rerank_pool:
+                break
+            pool.append(n)
+        nodes = pool
 
-Rules:
-- Resolve sector/industry terms (e.g. "pharma" → PFE, JNJ, MRK, LLY, ABBV)
-- Resolve relative time (e.g. "last 2 years" → the 2 most recent years in the data)
-- "annual report" or "10-K" → ["10-K"] only
-- "quarterly" or "10-Q"    → ["10-Q"] only
-- unspecified filing type  → ["10-K", "10-Q"]
-- Only include tickers that actually have data for the requested years
-- If query is broad ("all companies"), include all tickers
+        if self.verbose:
+            print(f"[PreRerank] {len(nodes)} candidates across {len(ticker_counts)} tickers")
 
-Respond with ONLY the JSON object, no explanation outside it.
-"""
-        response = Settings.llm.complete(prompt)
-        raw = response.text.strip()
-        # Strip markdown code fences if the model wraps the JSON
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw.strip())
-        plan = json.loads(raw)
-
-        # Clamp to what actually exists in the manifest
-        plan["tickers"] = [
-            t for t in plan["tickers"]
-            if t in self._coverage
-            and any(y in self._coverage[t]["years"] for y in plan["years"])
-        ]
-        plan["years"] = [
-            y for y in plan["years"]
-            if any(y in self._coverage[t]["years"] for t in plan["tickers"])
-        ]
-        return plan
-
-    async def _retrieve_nodes(self, query: str, plan: dict) -> list[NodeWithScore]:
-        """
-        Pure vector retrieval — no LLM calls.
-
-        Runs one filtered retriever per (ticker, filing_type, fiscal_year) combination
-        concurrently, then deduplicates results by node_id.
-        """
-        async def _retrieve_one(ticker, filing_type, fiscal_year):
-            filters = [
-                MetadataFilter(key="ticker", value=ticker, operator=FilterOperator.EQ),
-                MetadataFilter(key="filing_type", value=filing_type, operator=FilterOperator.EQ),
-                MetadataFilter(key="fiscal_year", value=fiscal_year, operator=FilterOperator.EQ),
-            ]
-            retriever = self.index.as_retriever(
-                similarity_top_k=self.top_k,
-                filters=MetadataFilters(filters=filters),
+        # Cross-encoder reranking for precision
+        if len(nodes) > 1:
+            nodes = self._reranker.postprocess_nodes(
+                nodes, query_bundle=QueryBundle(query_str=query)
             )
-            return await retriever.aretrieve(query)
+            # Normalize raw logits → probabilities via sigmoid so scores are interpretable
+            for n in nodes:
+                if n.score is not None:
+                    n.score = 1.0 / (1.0 + math.exp(-float(n.score)))
+            if self.verbose:
+                scores = [n.score for n in nodes if n.score is not None]
+                if scores:
+                    print(
+                        f"[Reranker] {len(nodes)} nodes  "
+                        f"score range: {min(scores):.4f}–{max(scores):.4f}"
+                    )
 
-        tasks = []
-        for ticker in plan["tickers"]:
-            coverage = self._coverage[ticker]
-            for year in plan["years"]:
-                if year not in coverage["years"]:
-                    continue
-                for filing_type in plan["filing_types"]:
-                    if filing_type not in coverage["types"]:
-                        continue
-                    tasks.append(_retrieve_one(ticker, filing_type, year))
+        # Ticker-aware MMR selection — balances relevance with company diversity
+        nodes = self._mmr_diversity_select(nodes)
 
-        results = await asyncio.gather(*tasks)
+        if self.verbose:
+            print(f"[SecQueryEngine] {len(nodes)} nodes passed to synthesis")
 
-        # Flatten and deduplicate by node_id
-        seen, nodes = set(), []
-        for batch in results:
-            for n in batch:
-                if n.node_id not in seen:
-                    seen.add(n.node_id)
-                    nodes.append(n)
         return nodes
 
+    def _mmr_diversity_select(self, nodes: list[NodeWithScore]) -> list[NodeWithScore]:
+        """
+        Greedy MMR that balances reranker relevance with ticker diversity.
+
+        Each step selects the candidate that maximises:
+            mmr_lambda * reranker_score  -  (1 - mmr_lambda) * overrepresentation_penalty
+
+        overrepresentation_penalty = min(chunks_already_selected_for_ticker / mmr_soft_cap, 1.0)
+
+        With mmr_lambda=0.5 and mmr_soft_cap=5, the first 5 chunks from any
+        company are chosen on pure relevance; beyond that, penalty ramps to 1.0
+        and other companies' chunks are strongly preferred.
+        """
+        from collections import Counter, defaultdict
+
+        selected: list[NodeWithScore] = []
+        candidates = list(nodes)
+        ticker_counts: dict[str, int] = defaultdict(int)
+
+        while len(selected) < self.max_synthesis_nodes and candidates:
+            best_score = -float("inf")
+            best_idx   = 0
+            for i, n in enumerate(candidates):
+                relevance = float(n.score or 0.0)
+                ticker    = n.node.metadata.get("ticker", "")
+                penalty   = min(ticker_counts[ticker] / self._mmr_soft_cap, 1.0)
+                combined  = self._mmr_lambda * relevance - (1 - self._mmr_lambda) * penalty
+                if combined > best_score:
+                    best_score = combined
+                    best_idx   = i
+
+            chosen = candidates.pop(best_idx)
+            selected.append(chosen)
+            ticker_counts[chosen.node.metadata.get("ticker", "")] += 1
+
+        if self.verbose:
+            dist = dict(Counter(n.node.metadata.get("ticker") for n in selected))
+            print(f"[MMR] {len(selected)} nodes — ticker distribution: {dist}")
+
+        return selected
+
     def _build_synthesis_prompt(self, query: str, nodes: list[NodeWithScore]) -> str:
-        """Build the synthesis prompt shared by _synthesize and _synthesize_stream."""
+        """Build the single synthesis prompt from retrieved chunks."""
         context_parts = []
         for i, n in enumerate(nodes, 1):
-            m = n.node.metadata
-            quarter = m.get("fiscal_quarter")
-            period = f"FY{m.get('fiscal_year', '')} Q{quarter}" if quarter else f"FY{m.get('fiscal_year', '')}"
-            header = (
-                f"[{i}] {m.get('ticker', '')} {m.get('filing_type', '')} "
-                f"{period} — {m.get('section_label', '')}"
-            )
-            context_parts.append(f"{header}\n{n.node.get_content()}")
+            context_parts.append(f"[{i}]\n{n.node.get_content()}")
         context = "\n\n---\n\n".join(context_parts)
 
         return f"""You are a financial analyst. Answer the question below using only the provided SEC filing excerpts.
@@ -353,10 +252,7 @@ SEC Filing Excerpts:
 Answer:"""
 
     def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> str:
-        """
-        LLM call #2 (after retrieval): produce a final answer from retrieved nodes.
-        This is the only generative call made after the retrieval pipeline.
-        """
+        """Single LLM call to produce a final answer from retrieved nodes."""
         prompt = self._build_synthesis_prompt(query, nodes)
         response = Settings.llm.complete(prompt)
         return response.text.strip()
@@ -370,32 +266,12 @@ Answer:"""
             if chunk.delta:
                 yield chunk.delta
 
-    async def aplan_query(self, query: str) -> dict:
-        """Async wrapper for _plan_query — runs in a thread pool to avoid blocking the event loop."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._plan_query, query)
-
     # ------------------------------------------------------------------
     # LlamaIndex-compatible interface
     # ------------------------------------------------------------------
 
     def as_query_engine(self) -> "BaseQueryEngine":
-        """
-        Return a standard LlamaIndex BaseQueryEngine wrapping this engine.
-
-        The returned object can be used anywhere LlamaIndex expects a
-        query engine: RouterQueryEngine, agent tools, QueryPipeline, etc.
-
-        Example
-        -------
-        qe = sec_engine.as_query_engine()
-
-        # sync
-        response = qe.query("What did pharma companies say about pricing in 2024?")
-
-        # async
-        response = await qe.aquery("Compare AAPL and MSFT margins in 2024")
-        """
+        """Return a standard LlamaIndex BaseQueryEngine wrapping this engine."""
         return _DynamicSecQueryEngine(self)
 
     def as_tool(
@@ -408,24 +284,7 @@ Answer:"""
             "Use for revenue, margins, risk factors, and management commentary."
         ),
     ) -> "QueryEngineTool":
-        """
-        Return a QueryEngineTool wrapping this engine — ready to hand to an
-        agent, RouterQueryEngine, or SubQuestionQueryEngine as a single tool
-        representing the entire SEC corpus.
-
-        Example
-        -------
-        from llama_index.core.query_engine import RouterQueryEngine
-        from llama_index.core.selectors import LLMSingleSelector
-
-        router = RouterQueryEngine(
-            selector=LLMSingleSelector.from_defaults(),
-            query_engine_tools=[
-                sec_engine.as_tool(),
-                other_tool,
-            ],
-        )
-        """
+        """Return a QueryEngineTool wrapping this engine."""
         return QueryEngineTool(
             query_engine=self.as_query_engine(),
             metadata=ToolMetadata(name=name, description=description),
@@ -437,16 +296,12 @@ Answer:"""
 # ---------------------------------------------------------------------------
 
 class _DynamicSecQueryEngine(BaseQueryEngine):
-    """
-    Internal LlamaIndex-compatible wrapper around SecQueryEngine.
-    Instantiate via SecQueryEngine.as_query_engine(), not directly.
-    """
+    """Internal LlamaIndex-compatible wrapper. Use SecQueryEngine.as_query_engine()."""
 
     def __init__(self, sec_engine: "SecQueryEngine"):
         self._sec = sec_engine
         super().__init__(callback_manager=Settings.callback_manager or CallbackManager())
 
-    # -- sync path --
     def _query(self, query_bundle: QueryBundle) -> RESPONSE_TYPE:
         try:
             loop = asyncio.get_event_loop()
@@ -457,19 +312,14 @@ class _DynamicSecQueryEngine(BaseQueryEngine):
         except RuntimeError:
             return asyncio.run(self._aquery(query_bundle))
 
-    # -- async path (preferred) --
     async def _aquery(self, query_bundle: QueryBundle) -> RESPONSE_TYPE:
         query_str = (
             query_bundle.query_str
             if isinstance(query_bundle, QueryBundle)
             else str(query_bundle)
         )
-        plan  = self._sec._plan_query(query_str)
-        nodes = await self._sec._retrieve_nodes(query_str, plan)
-
+        nodes = await self._sec._retrieve_nodes(query_str)
         if self._sec.verbose:
-            print(f"\n[Plan]\n{json.dumps(plan, indent=2)}")
-            print(f"[Nodes retrieved] {len(nodes)}\n")
-
+            print(f"[Nodes retrieved] {len(nodes)}")
         answer = self._sec._synthesize(query_str, nodes)
         return Response(response=answer)

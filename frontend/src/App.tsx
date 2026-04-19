@@ -1,13 +1,12 @@
 import { useState } from 'react';
 import { useQuery } from './hooks/useQuery';
 import { ChatInput } from './components/ChatInput';
-import { QueryPlanPanel } from './components/QueryPlanPanel';
 import { NodesSidebar } from './components/NodesSidebar';
 import { StreamingAnswer } from './components/StreamingAnswer';
 import { SourceChips } from './components/SourceChips';
 
 export default function App() {
-  const { plan, nodes, answer, sources, isStreaming, error, submitQuery } = useQuery();
+  const { nodes, answer, sources, isStreaming, error, submitQuery } = useQuery();
   const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(new Set());
   const [scrollTargetId, setScrollTargetId] = useState<string | null>(null);
 
@@ -36,11 +35,6 @@ export default function App() {
       <div className="px-4 py-3 border-b border-slate-200 bg-white flex items-center gap-3 shrink-0">
         <div className="w-2 h-2 rounded-full bg-indigo-500" />
         <h1 className="text-sm font-semibold text-slate-700 tracking-wide">SEC Filings RAG</h1>
-      </div>
-
-      {/* Query Plan banner */}
-      <div className="shrink-0">
-        <QueryPlanPanel plan={plan} />
       </div>
 
       {/* Main body: answer (left) + nodes sidebar (right) */}

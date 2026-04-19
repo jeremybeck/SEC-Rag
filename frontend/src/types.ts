@@ -1,10 +1,3 @@
-export interface PlanData {
-  tickers: string[];
-  years: number[];
-  filing_types: string[];
-  reasoning: string;
-}
-
 export interface NodeData {
   node_id: string;
   ticker: string;
@@ -25,7 +18,6 @@ export interface SourceData {
 }
 
 export type SSEEvent =
-  | { type: 'plan'; data: PlanData }
   | { type: 'nodes'; data: NodeData[] }
   | { type: 'token'; data: string }
   | { type: 'sources'; data: SourceData[] }

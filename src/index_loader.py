@@ -58,6 +58,12 @@ def get_vector_store() -> PGVectorStore:
             "pool_size": 10,
             "max_overflow": 20,
         },
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
     )
 
 

@@ -203,7 +203,7 @@ class SecQueryEngine:
         max_synthesis_nodes: int   = 50,
         mmr_lambda:          float = 0.5,
         mmr_soft_cap:        int   = 5,
-        prompt_file:         str   = "synthesis_v3.txt",
+        prompt_file:         str   = "synthesis_v4.txt",
     ):
         self.index                = index
         self.top_k                = top_k

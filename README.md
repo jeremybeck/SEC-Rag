@@ -46,7 +46,11 @@ export OPENAI_API_KEY=sk-...
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/secrag
 ```
 
-### 5. Populate the vector index
+### 5. (First run) Cross-encoder model download
+
+The retrieval pipeline uses a local cross-encoder model (`cross-encoder/ms-marco-MiniLM-L-6-v2`, ~22 MB) for reranking. It is downloaded automatically from HuggingFace on first use via `sentence-transformers` — no manual step required, but an internet connection is needed the first time the query engine runs.
+
+### 6. Populate the vector index
 
 Run the index builder to chunk the filings, generate embeddings, and store them in pgvector:
 
@@ -84,7 +88,6 @@ npm run dev
 
 Open `http://localhost:5173`. The UI provides:
 - A chat input at the bottom
-- A **Query Plan** banner (appears after the LLM resolves tickers/years)
 - A streaming answer with markdown rendering
 - A **Retrieved Nodes** sidebar on the right (grouped by ticker + filing)
 - Source citation chips below the answer
@@ -108,3 +111,7 @@ To also delete all stored data:
 ```bash
 docker compose down -v
 ```
+
+## Design
+
+See [Design Decisions](docs/design-decisions.md) for the reasoning behind key architectural choices in indexing, retrieval, and synthesis.

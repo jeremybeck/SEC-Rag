@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useQuery } from './hooks/useQuery';
 import { ChatInput } from './components/ChatInput';
 import { DataQualityBadge } from './components/DataQualityBadge';
+import { FeedbackBar } from './components/FeedbackBar';
 import { NodesSidebar } from './components/NodesSidebar';
 import { StreamingAnswer } from './components/StreamingAnswer';
 import { SourceChips } from './components/SourceChips';
@@ -69,6 +70,14 @@ export default function App() {
           <div className="shrink-0">
             <SourceChips sources={sources} onActivate={activateNode} expandedNodeIds={expandedNodeIds} />
           </div>
+
+          <FeedbackBar
+            query={currentQuery ?? ''}
+            answer={answer}
+            sources={sources}
+            dataQuality={dataQuality}
+            isStreaming={isStreaming}
+          />
         </div>
 
         {/* Right: nodes sidebar */}

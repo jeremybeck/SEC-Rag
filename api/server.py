@@ -16,11 +16,13 @@ Usage:
 """
 
 import json
+import os
 import sys
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -44,7 +46,30 @@ async def lifespan(app: FastAPI):
     index = load_index()
     app.state.engine = SecQueryEngine(index=index, verbose=True)
     print("[server] SecQueryEngine ready.")
+
+    # Feedback DB pool — asyncpg accepts the standard postgresql:// URL directly
+    feedback_pool = await asyncpg.create_pool(
+        os.environ["DATABASE_URL"], min_size=1, max_size=5
+    )
+    async with feedback_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS query_feedback (
+                id            SERIAL PRIMARY KEY,
+                query_text    TEXT        NOT NULL,
+                answer_text   TEXT        NOT NULL,
+                cited_sources JSONB,
+                data_quality  TEXT,
+                rating        TEXT,
+                feedback_text TEXT,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+    app.state.feedback_pool = feedback_pool
+    print("[server] Feedback table ready.")
+
     yield
+
+    await feedback_pool.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -59,6 +84,15 @@ app.add_middleware(
 
 class QueryRequest(BaseModel):
     query: str
+
+
+class FeedbackRequest(BaseModel):
+    query_text:    str
+    answer_text:   str
+    cited_sources: list[dict] = []
+    data_quality:  str | None = None
+    rating:        str | None = None   # "up" | "down" | None
+    feedback_text: str | None = None
 
 
 def _event(payload: dict) -> dict:
@@ -148,3 +182,22 @@ async def query_endpoint(request: Request, body: QueryRequest):
             yield _event({"type": "error", "data": str(e)})
 
     return EventSourceResponse(event_generator())
+
+
+@app.post("/feedback", status_code=204)
+async def submit_feedback(request: Request, body: FeedbackRequest):
+    pool = request.app.state.feedback_pool
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO query_feedback
+                (query_text, answer_text, cited_sources, data_quality, rating, feedback_text)
+            VALUES ($1, $2, $3::jsonb, $4, $5, $6)
+            """,
+            body.query_text,
+            body.answer_text,
+            json.dumps(body.cited_sources),
+            body.data_quality,
+            body.rating,
+            body.feedback_text or None,
+        )

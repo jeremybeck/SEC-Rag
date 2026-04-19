@@ -7,4 +7,4 @@ uvicorn[standard]
 sse-starlette
 uvicorn
 torch
-sentence-transformers
+sentence-transformersasyncpg>=0.29

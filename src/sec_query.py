@@ -17,6 +17,7 @@ Basic usage:
 
 import asyncio
 import math
+from collections import defaultdict
 from typing import AsyncGenerator
 
 from llama_index.core import VectorStoreIndex, Settings
@@ -54,17 +55,23 @@ class SecQueryEngine:
     def __init__(
         self,
         index:               VectorStoreIndex,
-        top_k:               int  = 5000,
+        top_k:               int  = 2500,
         verbose:             bool = True,
         debug:               bool = False,
-        rerank_pool:         int  = 200,
-        max_synthesis_nodes: int  = 50,
+        rerank_pool:         int   = 200,
+        rerank_per_ticker:   int   = 15,
+        max_synthesis_nodes: int   = 50,
+        mmr_lambda:          float = 0.5,
+        mmr_soft_cap:        int   = 5,
     ):
-        self.index               = index
-        self.top_k               = top_k
-        self.verbose             = verbose
-        self.max_synthesis_nodes = max_synthesis_nodes
-        self._rerank_pool        = rerank_pool
+        self.index                = index
+        self.top_k                = top_k
+        self.verbose              = verbose
+        self.max_synthesis_nodes  = max_synthesis_nodes
+        self._rerank_pool         = rerank_pool
+        self._rerank_per_ticker   = rerank_per_ticker
+        self._mmr_lambda          = mmr_lambda
+        self._mmr_soft_cap        = mmr_soft_cap
 
         if debug:
             self._debug_handler = LlamaDebugHandler(print_trace_on_end=True)
@@ -138,8 +145,28 @@ class SecQueryEngine:
             if self.verbose:
                 print(f"[SimFilter] cutoff {self._sim_filter.similarity_cutoff} removed all nodes — skipping filter")
 
-        # Pre-cap by cosine score before reranking — rerankers are slow on 500+ candidates
-        nodes = sorted(nodes, key=lambda n: n.score or 0, reverse=True)[:self._rerank_pool]
+        # Pre-rerank pool: guarantee each ticker gets at least rerank_per_ticker candidates,
+        # then fill remaining slots with the highest-cosine nodes from any ticker.
+        # Without this, a dominant company fills all slots and the cross-encoder never
+        # sees the other company's chunks.
+        nodes = sorted(nodes, key=lambda n: n.score or 0, reverse=True)
+        ticker_counts: dict[str, int] = defaultdict(int)
+        pool, remainder = [], []
+        for n in nodes:
+            ticker = n.node.metadata.get("ticker", "")
+            if ticker_counts[ticker] < self._rerank_per_ticker:
+                pool.append(n)
+                ticker_counts[ticker] += 1
+            else:
+                remainder.append(n)
+        for n in remainder:
+            if len(pool) >= self._rerank_pool:
+                break
+            pool.append(n)
+        nodes = pool
+
+        if self.verbose:
+            print(f"[PreRerank] {len(nodes)} candidates across {len(ticker_counts)} tickers")
 
         # Cross-encoder reranking for precision
         if len(nodes) > 1:
@@ -158,13 +185,54 @@ class SecQueryEngine:
                         f"score range: {min(scores):.4f}–{max(scores):.4f}"
                     )
 
-        # Cap nodes sent to synthesis LLM to avoid context-window overflow
-        nodes = sorted(nodes, key=lambda n: n.score or 0, reverse=True)[: self.max_synthesis_nodes]
+        # Ticker-aware MMR selection — balances relevance with company diversity
+        nodes = self._mmr_diversity_select(nodes)
 
         if self.verbose:
             print(f"[SecQueryEngine] {len(nodes)} nodes passed to synthesis")
 
         return nodes
+
+    def _mmr_diversity_select(self, nodes: list[NodeWithScore]) -> list[NodeWithScore]:
+        """
+        Greedy MMR that balances reranker relevance with ticker diversity.
+
+        Each step selects the candidate that maximises:
+            mmr_lambda * reranker_score  -  (1 - mmr_lambda) * overrepresentation_penalty
+
+        overrepresentation_penalty = min(chunks_already_selected_for_ticker / mmr_soft_cap, 1.0)
+
+        With mmr_lambda=0.5 and mmr_soft_cap=5, the first 5 chunks from any
+        company are chosen on pure relevance; beyond that, penalty ramps to 1.0
+        and other companies' chunks are strongly preferred.
+        """
+        from collections import Counter, defaultdict
+
+        selected: list[NodeWithScore] = []
+        candidates = list(nodes)
+        ticker_counts: dict[str, int] = defaultdict(int)
+
+        while len(selected) < self.max_synthesis_nodes and candidates:
+            best_score = -float("inf")
+            best_idx   = 0
+            for i, n in enumerate(candidates):
+                relevance = float(n.score or 0.0)
+                ticker    = n.node.metadata.get("ticker", "")
+                penalty   = min(ticker_counts[ticker] / self._mmr_soft_cap, 1.0)
+                combined  = self._mmr_lambda * relevance - (1 - self._mmr_lambda) * penalty
+                if combined > best_score:
+                    best_score = combined
+                    best_idx   = i
+
+            chosen = candidates.pop(best_idx)
+            selected.append(chosen)
+            ticker_counts[chosen.node.metadata.get("ticker", "")] += 1
+
+        if self.verbose:
+            dist = dict(Counter(n.node.metadata.get("ticker") for n in selected))
+            print(f"[MMR] {len(selected)} nodes — ticker distribution: {dist}")
+
+        return selected
 
     def _build_synthesis_prompt(self, query: str, nodes: list[NodeWithScore]) -> str:
         """Build the single synthesis prompt from retrieved chunks."""

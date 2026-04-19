@@ -9,3 +9,9 @@ __pycache__/
 
 # IDE
 .idea/
+
+# Eval artifacts (generated, not committed)
+eval/dataset.json
+eval/dataset_meta.json
+eval/results.csv
+# Baseline snapshots are committed (results_*.csv excluded from this rule)

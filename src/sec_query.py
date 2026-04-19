@@ -16,9 +16,7 @@ Basic usage:
 """
 
 import asyncio
-import json
 import math
-import re
 from collections import defaultdict
 from pathlib import Path
 from typing import AsyncGenerator
@@ -28,8 +26,16 @@ from llama_index.core.base.base_query_engine import BaseQueryEngine
 from llama_index.core.base.response.schema import RESPONSE_TYPE, Response
 from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler
 from llama_index.core.postprocessor import SentenceTransformerRerank, SimilarityPostprocessor
+from llama_index.core.prompts import PromptTemplate
 from llama_index.core.schema import QueryBundle, NodeWithScore
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
+from pydantic import BaseModel
+
+
+class SynthesisResponse(BaseModel):
+    """Structured output schema for the synthesis LLM call."""
+    answer:    str
+    citations: list[int]
 
 
 class SecQueryEngine:
@@ -250,44 +256,30 @@ class SecQueryEngine:
         return self._prompt_template.format(query=query, context=context)
 
     def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> tuple[str, list[str]]:
-        """Single LLM call; returns (answer_text, cited_node_ids)."""
+        """
+        Single LLM call via structured_predict — returns (answer_text, cited_node_ids).
+
+        Uses LlamaIndex's structured_predict with the SynthesisResponse Pydantic model,
+        which routes through OpenAI's function-calling API and guarantees the output
+        matches the schema (answer: str, citations: list[int]).
+        """
         prompt = self._build_synthesis_prompt(query, nodes)
-        response = Settings.llm.complete(prompt)
-        return self._parse_synthesis_response(response.text.strip(), nodes)
-
-    def _parse_synthesis_response(
-        self, text: str, nodes: list[NodeWithScore]
-    ) -> tuple[str, list[str]]:
-        """
-        Parse the JSON synthesis response into (answer_text, cited_node_ids).
-
-        Tries strict JSON parse first; falls back to regex extraction of the
-        outermost {...} block (handles markdown fences or stray preamble).
-        If both fail, returns (raw_text, []) so the caller always gets a string.
-        """
-        parsed = None
         try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if match:
-                try:
-                    parsed = json.loads(match.group())
-                except json.JSONDecodeError:
-                    pass
-
-        if parsed is None or not isinstance(parsed, dict):
-            print("[SecQueryEngine] WARNING: could not parse JSON response — returning raw text")
-            return text, []
-
-        answer = parsed.get("answer", text)
-        raw_citations = parsed.get("citations", [])
-        cited_node_ids = [
-            nodes[i - 1].node_id
-            for i in raw_citations
-            if isinstance(i, int) and 1 <= i <= len(nodes)
-        ]
-        return answer, cited_node_ids
+            result: SynthesisResponse = Settings.llm.structured_predict(
+                SynthesisResponse,
+                PromptTemplate("{prompt_str}"),
+                prompt_str=prompt,
+            )
+            cited_node_ids = [
+                nodes[i - 1].node_id
+                for i in result.citations
+                if isinstance(i, int) and 1 <= i <= len(nodes)
+            ]
+            return result.answer, cited_node_ids
+        except Exception as e:
+            print(f"[SecQueryEngine] WARNING: structured_predict failed ({e}) — falling back to plain complete")
+            response = Settings.llm.complete(prompt)
+            return response.text.strip(), []
 
     # NOTE: no longer called by the server; retained for potential direct use.
     async def _synthesize_stream(

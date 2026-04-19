@@ -38,27 +38,7 @@ from sec_query import SecQueryEngine
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
-    Settings.llm = OpenAI(
-        model="gpt-4o",
-        additional_kwargs={
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "synthesis_response",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "answer":    {"type": "string"},
-                            "citations": {"type": "array", "items": {"type": "integer"}},
-                        },
-                        "required": ["answer", "citations"],
-                        "additionalProperties": False,
-                    },
-                },
-            }
-        },
-    )
+    Settings.llm = OpenAI(model="gpt-4o")
 
     index = load_index()
     app.state.engine = SecQueryEngine(index=index, verbose=True)

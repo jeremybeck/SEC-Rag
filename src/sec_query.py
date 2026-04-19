@@ -276,7 +276,7 @@ class SecQueryEngine:
                 except json.JSONDecodeError:
                     pass
 
-        if parsed is None:
+        if parsed is None or not isinstance(parsed, dict):
             print("[SecQueryEngine] WARNING: could not parse JSON response — returning raw text")
             return text, []
 

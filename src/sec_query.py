@@ -16,6 +16,7 @@ Basic usage:
 """
 
 import asyncio
+import datetime
 import math
 import re
 from collections import defaultdict
@@ -31,7 +32,15 @@ from llama_index.core.postprocessor import SentenceTransformerRerank, Similarity
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.schema import QueryBundle, NodeWithScore
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
+from llama_index.core.vector_stores import (
+    MetadataFilters,
+    MetadataFilter,
+    FilterOperator,
+    FilterCondition,
+)
 from pydantic import BaseModel
+
+CURRENT_YEAR: int = datetime.date.today().year
 
 
 class Citation(BaseModel):
@@ -61,6 +70,101 @@ class SynthesisResult:
     cited_node_ids: list[str]
     cited_quotes:   list[str]
     data_quality:   DataQualityAssessment | None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Query-to-metadata filter helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_year_filters(query: str) -> list[int] | None:
+    """
+    Extract fiscal years mentioned in a query.
+
+    Handles:
+    - Explicit years: "2024", "fiscal 2025"
+    - Relative spans: "last 3 years", "past two years"
+    - Recency signals: "recent", "latest", "current" → last 2 years
+
+    Returns a list of ints, or None if no year signal is found.
+    """
+    years: set[int] = set()
+
+    for y in re.findall(r'\b(202[3-9]|20[3-9]\d)\b', query):
+        years.add(int(y))
+
+    n_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+    m = re.search(r'(?:last|past)\s+(\w+)\s+years?', query, re.IGNORECASE)
+    if m:
+        n_str = m.group(1).lower()
+        n = int(n_str) if n_str.isdigit() else n_map.get(n_str, 2)
+        years.update(CURRENT_YEAR - i for i in range(n))
+
+    if re.search(r'\b(recent|latest|current)\b', query, re.IGNORECASE):
+        years.update([CURRENT_YEAR - 1, CURRENT_YEAR])
+
+    return list(years) if years else None
+
+
+def extract_company_filters(query: str) -> list[str] | None:
+    """
+    Extract ticker symbols from a query (handles both symbols and full names).
+
+    Ticker symbols: matched as uppercase sequences (e.g. "AAPL", "JPM").
+    Company names: whole-word matched against words >= 5 chars from TICKER_NAMES
+    (e.g. "Apple", "Google", "Johnson") to avoid false positives on short fragments.
+
+    Returns a sorted list of uppercase tickers, or None if no company found.
+    """
+    try:
+        from filing_parser import TICKER_NAMES
+    except ImportError:
+        return None
+
+    # Map from unambiguous company name words (>= 5 chars) to ticker.
+    # Short tickers (< 3 chars) like "T", "V", "MA" are too ambiguous for
+    # word-based matching — they are caught by the uppercase regex below.
+    name_map: dict[str, str] = {}
+    for ticker, name in TICKER_NAMES.items():
+        for word in name.lower().split():
+            # Strip punctuation like "&" from "AT&T", skip short words
+            clean = re.sub(r'[^a-z]', '', word)
+            if len(clean) >= 5:
+                name_map[clean] = ticker
+
+    found: set[str] = set()
+
+    # Match known ticker symbols appearing as uppercase tokens in the query
+    for m in re.finditer(r'\b([A-Z]{2,5})\b', query):
+        candidate = m.group(1)
+        if candidate in TICKER_NAMES:
+            found.add(candidate)
+
+    # Match company name words as whole words (not substrings)
+    for word, ticker in name_map.items():
+        if re.search(r'\b' + word + r'\b', query, re.IGNORECASE):
+            found.add(ticker)
+
+    return sorted(found) if found else None
+
+
+def build_metadata_filters(query: str) -> MetadataFilters | None:
+    """
+    Build LlamaIndex MetadataFilters from fiscal year signals in a query.
+
+    Year filters use fiscal_year (int), ORed together.
+    Returns None if no year signal is found (no pre-filtering applied).
+    """
+    years = extract_year_filters(query)
+    if not years:
+        return None
+
+    return MetadataFilters(
+        filters=[
+            MetadataFilter(key="fiscal_year", value=y, operator=FilterOperator.EQ)
+            for y in years
+        ],
+        condition=FilterCondition.OR,
+    )
 
 
 class SecQueryEngine:
@@ -151,7 +255,13 @@ class SecQueryEngine:
         Relies on chunk enrichment (company/year/section prefix in chunk text)
         to surface relevant passages via cosine similarity.
         """
-        retriever = self.index.as_retriever(similarity_top_k=self.top_k)
+        metadata_filters = build_metadata_filters(query)
+        retriever = self.index.as_retriever(
+            similarity_top_k=self.top_k,
+            filters=metadata_filters,
+        )
+        if self.verbose and metadata_filters is not None:
+            print(f"[Retrieval] metadata filter — years={extract_year_filters(query)}")
         nodes = await retriever.aretrieve(query)
 
         # Deduplicate by node_id
@@ -284,6 +394,90 @@ class SecQueryEngine:
             .replace("{context}", context)
         )
 
+    # word/ticker fragment → canonical ticker, built once at class level
+    _NAME_TO_TICKER: dict[str, str] = {}
+    _ALL_TICKERS:    set[str]        = set()
+
+    @classmethod
+    def _build_name_map(cls) -> None:
+        """Populate _NAME_TO_TICKER and _ALL_TICKERS from filing_parser.TICKER_NAMES."""
+        if cls._NAME_TO_TICKER:
+            return
+        try:
+            from filing_parser import TICKER_NAMES
+            for ticker, name in TICKER_NAMES.items():
+                cls._ALL_TICKERS.add(ticker)
+                cls._NAME_TO_TICKER[ticker.lower()] = ticker
+                for word in name.lower().split():
+                    if len(word) >= 4:
+                        cls._NAME_TO_TICKER[word] = ticker
+        except ImportError:
+            pass
+
+    def _check_claimed_numbers(
+        self,
+        answer: str,
+        citations: list[Citation],
+        nodes: list[NodeWithScore],
+    ) -> list[int]:
+        """
+        For each [N] citation in the answer, find numbers claimed in nearby text
+        and verify they appear in node N's full text.
+
+        Returns original citation indices where claimed numbers cannot be found
+        in the source node — indicating the model drew on training knowledge
+        rather than the provided excerpt.
+
+        Number patterns matched: dollar amounts, comma-separated figures,
+        and numbers followed by billion/million/thousand/%.
+        """
+        number_pat = re.compile(
+            r'\$[\d,]+(?:\.\d+)?(?:\s*(?:billion|million|thousand|B|M))?'
+            r'|\b\d+(?:,\d{3})+(?:\.\d+)?\b'
+            r'|\b\d+(?:\.\d+)?\s*(?:billion|million|thousand|%)',
+            re.IGNORECASE,
+        )
+        citation_pat = re.compile(r'\[(\d+)\]')
+
+        valid_orig = {c.index for c in citations}
+        cit_positions = [
+            (m.start(), int(m.group(1)))
+            for m in citation_pat.finditer(answer)
+            if int(m.group(1)) in valid_orig
+        ]
+        if not cit_positions:
+            return []
+
+        unverified: set[int] = set()
+
+        for nm in number_pat.finditer(answer):
+            num_str = nm.group(0)
+            pos     = nm.start()
+
+            # Find nearest valid [N] within 300 chars before or 100 chars after
+            nearest_idx, best_dist = None, 9999
+            for cpos, cidx in cit_positions:
+                if cpos <= pos:
+                    d = pos - cpos
+                    if d <= 300 and d < best_dist:
+                        best_dist, nearest_idx = d, cidx
+                else:
+                    d = cpos - pos
+                    if d <= 100 and d < best_dist:
+                        best_dist, nearest_idx = d, cidx
+
+            if nearest_idx is None or not (1 <= nearest_idx <= len(nodes)):
+                continue
+
+            node_text = nodes[nearest_idx - 1].node.get_content()
+            norm_text = node_text.lower().replace(',', '').replace('$', '')
+            norm_num  = num_str.lower().replace(',', '').replace('$', '').strip()
+
+            if norm_num and len(norm_num) >= 3 and norm_num not in norm_text:
+                unverified.add(nearest_idx)
+
+        return list(unverified)
+
     def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> SynthesisResult:
         """
         Single LLM call via structured_predict.
@@ -321,11 +515,90 @@ class SecQueryEngine:
             )
             cited_node_ids = [nodes[orig - 1].node_id for orig in seen]
             cited_quotes   = [quote_map.get(orig, "") for orig in seen]
+
+            # --- Programmatic calibration overrides ---
+            # Work on original (pre-remap) answer so citation indices match nodes directly.
+            data_quality = result.data_quality
+
+            # 1. Number verification: check that specific numbers claimed near each [N]
+            #    can actually be found in node N's full text. This catches the main
+            #    confabulation pattern: model recalls a specific figure from training
+            #    knowledge, cites a related-but-different excerpt, and rates itself HIGH.
+            if data_quality is not None and result.citations:
+                unverified = self._check_claimed_numbers(
+                    result.answer, result.citations, nodes
+                )
+                n_total = len(result.citations)
+                n_bad   = len(unverified)
+                if n_bad > 0 and data_quality.rating == "HIGH":
+                    frac_bad   = n_bad / n_total
+                    new_rating = "LOW" if frac_bad > 0.5 else "MEDIUM"
+                    caveats = [
+                        f"Citation [{i}]: specific numbers in answer not found in source chunk"
+                        for i in sorted(unverified)
+                    ]
+                    data_quality = DataQualityAssessment(
+                        rating=new_rating,
+                        summary=(
+                            f"Number verification override: {n_bad}/{n_total} cited sources "
+                            f"do not contain the specific figures claimed in the answer. "
+                            f"Answer may draw on training knowledge rather than provided excerpts."
+                        ),
+                        missing_coverage=caveats,
+                    )
+                    print(
+                        f"[SecQueryEngine] Rating overridden HIGH→{new_rating}: "
+                        f"{n_bad}/{n_total} citations have unverified numbers"
+                    )
+
+            # 2. Ticker / company mismatch: if query names a company and all cited nodes
+            #    are from a different company, the answer is almost certainly from
+            #    training knowledge. Handles both ticker symbols ("JNJ") and full names
+            #    ("Johnson & Johnson").
+            if data_quality is not None and seen:
+                self._build_name_map()
+                query_lower = query.lower()
+                asked_ticker = None
+                # Try ticker symbol first (e.g. "JNJ", "GOOG") — O(1) lookup
+                tm = re.search(r'\b([A-Z]{2,5})\b', query)
+                if tm and tm.group(1) in self._ALL_TICKERS:
+                    asked_ticker = tm.group(1)
+                # Fall back to company-name word match
+                if asked_ticker is None:
+                    for word, ticker in self._NAME_TO_TICKER.items():
+                        if word in query_lower:
+                            asked_ticker = ticker
+                            break
+
+                if asked_ticker:
+                    cited_tickers_set = {
+                        nodes[orig - 1].node.metadata.get("ticker", "")
+                        for orig in seen
+                    }
+                    if cited_tickers_set and asked_ticker not in cited_tickers_set:
+                        data_quality = DataQualityAssessment(
+                            rating="LOW",
+                            summary=(
+                                f"Source mismatch: question asks about {asked_ticker} but "
+                                f"all cited sources are from "
+                                f"{', '.join(sorted(cited_tickers_set))}. "
+                                f"Answer likely drawn from training knowledge."
+                            ),
+                            missing_coverage=[
+                                f"No {asked_ticker} excerpts were cited; "
+                                f"cited sources: {', '.join(sorted(cited_tickers_set))}"
+                            ],
+                        )
+                        print(
+                            f"[SecQueryEngine] Rating overridden→LOW: company mismatch "
+                            f"(asked={asked_ticker}, cited={cited_tickers_set})"
+                        )
+
             return SynthesisResult(
                 answer=answer,
                 cited_node_ids=cited_node_ids,
                 cited_quotes=cited_quotes,
-                data_quality=result.data_quality,
+                data_quality=data_quality,
             )
         except Exception as e:
             print(f"[SecQueryEngine] WARNING: structured_predict failed ({e}) — falling back to plain complete")

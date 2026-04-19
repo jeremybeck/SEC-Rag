@@ -60,9 +60,11 @@ export default function App() {
             <StreamingAnswer answer={answer} isStreaming={isStreaming} />
           )}
 
+          {/* DataQualityBadge hidden — re-enable once confidence calibration is improved
           {dataQuality && !isStreaming && (
             <DataQualityBadge quality={dataQuality} />
           )}
+          */}
 
           <div className="shrink-0">
             <SourceChips sources={sources} onActivate={activateNode} expandedNodeIds={expandedNodeIds} />

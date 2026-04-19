@@ -19,8 +19,9 @@ import asyncio
 import math
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Literal
 
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.base.base_query_engine import BaseQueryEngine
@@ -39,10 +40,27 @@ class Citation(BaseModel):
     quote: str
 
 
+class DataQualityAssessment(BaseModel):
+    """LLM-generated assessment of how well the retrieved context covers the question."""
+    rating:           Literal["HIGH", "MEDIUM", "LOW"]
+    summary:          str
+    missing_coverage: list[str]
+
+
 class SynthesisResponse(BaseModel):
     """Structured output schema for the synthesis LLM call."""
-    answer:    str
-    citations: list[Citation]
+    answer:       str
+    citations:    list[Citation]
+    data_quality: DataQualityAssessment
+
+
+@dataclass
+class SynthesisResult:
+    """Return value from _synthesize — named fields instead of a positional tuple."""
+    answer:         str
+    cited_node_ids: list[str]
+    cited_quotes:   list[str]
+    data_quality:   DataQualityAssessment | None
 
 
 class SecQueryEngine:
@@ -266,14 +284,12 @@ class SecQueryEngine:
             .replace("{context}", context)
         )
 
-    def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> tuple[str, list[str], list[str]]:
+    def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> SynthesisResult:
         """
         Single LLM call via structured_predict.
-        Returns (answer_text, cited_node_ids, cited_quotes).
 
-        citation indices in the answer are renumbered 1-based by first appearance.
-        cited_quotes contains the verbatim excerpt the LLM pulled for each citation,
-        in the same order as cited_node_ids.
+        Citation indices in the answer are renumbered 1-based by first appearance.
+        Returns a SynthesisResult with answer, cited_node_ids, cited_quotes, and data_quality.
         """
         prompt = self._build_synthesis_prompt(query, nodes)
         try:
@@ -305,11 +321,21 @@ class SecQueryEngine:
             )
             cited_node_ids = [nodes[orig - 1].node_id for orig in seen]
             cited_quotes   = [quote_map.get(orig, "") for orig in seen]
-            return answer, cited_node_ids, cited_quotes
+            return SynthesisResult(
+                answer=answer,
+                cited_node_ids=cited_node_ids,
+                cited_quotes=cited_quotes,
+                data_quality=result.data_quality,
+            )
         except Exception as e:
             print(f"[SecQueryEngine] WARNING: structured_predict failed ({e}) — falling back to plain complete")
             response = Settings.llm.complete(prompt)
-            return response.text.strip(), [], []
+            return SynthesisResult(
+                answer=response.text.strip(),
+                cited_node_ids=[],
+                cited_quotes=[],
+                data_quality=None,
+            )
 
     # NOTE: no longer called by the server; retained for potential direct use.
     async def _synthesize_stream(
@@ -376,5 +402,5 @@ class _DynamicSecQueryEngine(BaseQueryEngine):
         nodes = await self._sec._retrieve_nodes(query_str)
         if self._sec.verbose:
             print(f"[Nodes retrieved] {len(nodes)}")
-        answer, _, _ = self._sec._synthesize(query_str, nodes)
-        return Response(response=answer)
+        r = self._sec._synthesize(query_str, nodes)
+        return Response(response=r.answer)

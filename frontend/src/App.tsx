@@ -1,12 +1,13 @@
 import { useState } from 'react';
 import { useQuery } from './hooks/useQuery';
 import { ChatInput } from './components/ChatInput';
+import { DataQualityBadge } from './components/DataQualityBadge';
 import { NodesSidebar } from './components/NodesSidebar';
 import { StreamingAnswer } from './components/StreamingAnswer';
 import { SourceChips } from './components/SourceChips';
 
 export default function App() {
-  const { nodes, answer, sources, isStreaming, error, submitQuery } = useQuery();
+  const { nodes, answer, sources, dataQuality, isStreaming, error, submitQuery } = useQuery();
   const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(new Set());
   const [scrollTargetId, setScrollTargetId] = useState<string | null>(null);
   const [currentQuery, setCurrentQuery] = useState<string | null>(null);
@@ -57,6 +58,10 @@ export default function App() {
             </div>
           ) : (
             <StreamingAnswer answer={answer} isStreaming={isStreaming} />
+          )}
+
+          {dataQuality && !isStreaming && (
+            <DataQualityBadge quality={dataQuality} />
           )}
 
           <div className="shrink-0">

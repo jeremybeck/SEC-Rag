@@ -17,6 +17,7 @@ Usage:
 
 import json
 import sys
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -89,32 +90,56 @@ async def query_endpoint(request: Request, body: QueryRequest):
                 })
             yield _event({"type": "nodes", "data": nodes_payload})
 
-            # Stage 3: Synthesize answer (single LLM call; returns cited node IDs + quotes)
-            answer, cited_node_ids, cited_quotes = engine._synthesize(query, nodes)
-            yield _event({"type": "token", "data": answer})
+            # Stage 3: Synthesize answer (single LLM call)
+            result = engine._synthesize(query, nodes)
+            yield _event({"type": "token", "data": result.answer})
 
-            # Stage 4: Sources — only nodes actually cited, with 1-based display index and verbatim quote
-            cited_set = set(cited_node_ids)
-            node_id_to_citation_index = {nid: i + 1 for i, nid in enumerate(cited_node_ids)}
-            node_id_to_quote = dict(zip(cited_node_ids, cited_quotes))
-            seen_sources = set()
-            sources = []
+            # Stage 3b: Data quality assessment
+            if result.data_quality is not None:
+                yield _event({"type": "quality", "data": {
+                    "rating":           result.data_quality.rating,
+                    "summary":          result.data_quality.summary,
+                    "missing_coverage": result.data_quality.missing_coverage,
+                }})
+
+            # Stage 4: Sources — deduplicated by section, collecting all citation indices per section
+            cited_set = set(result.cited_node_ids)
+            node_id_to_citation_index = {nid: i + 1 for i, nid in enumerate(result.cited_node_ids)}
+            node_id_to_quote = dict(zip(result.cited_node_ids, result.cited_quotes))
+
+            # First pass: group all citation indices and quotes by section key
+            section_indices: dict = defaultdict(list)
+            section_quotes:  dict = defaultdict(list)
+            section_node_id: dict = {}
+            section_meta:    dict = {}
             for n in nodes:
                 if n.node_id not in cited_set:
                     continue
                 m = n.node.metadata
                 key = (m.get("ticker"), m.get("filing_type"), m.get("fiscal_year"), m.get("section_label"))
-                if key not in seen_sources:
-                    seen_sources.add(key)
-                    sources.append({
-                        "ticker":          m.get("ticker"),
-                        "filing_type":     m.get("filing_type"),
-                        "fiscal_year":     m.get("fiscal_year"),
-                        "section_label":   m.get("section_label"),
-                        "node_id":         n.node_id,
-                        "citation_index":  node_id_to_citation_index[n.node_id],
-                        "quote":           node_id_to_quote.get(n.node_id, ""),
-                    })
+                section_indices[key].append(node_id_to_citation_index[n.node_id])
+                q = node_id_to_quote.get(n.node_id, "")
+                if q:
+                    section_quotes[key].append(q)
+                if key not in section_node_id:
+                    section_node_id[key] = n.node_id
+                    section_meta[key] = m
+
+            # Second pass: build sources in citation-index order (sort by first index in each group)
+            sources = []
+            for key in sorted(section_indices, key=lambda k: section_indices[k][0]):
+                m = section_meta[key]
+                indices = sorted(section_indices[key])
+                quotes  = section_quotes[key]
+                sources.append({
+                    "ticker":           m.get("ticker"),
+                    "filing_type":      m.get("filing_type"),
+                    "fiscal_year":      m.get("fiscal_year"),
+                    "section_label":    m.get("section_label"),
+                    "node_id":          section_node_id[key],
+                    "citation_indices": indices,
+                    "quote":            quotes[0] if quotes else "",
+                })
             yield _event({"type": "sources", "data": sources})
 
             yield _event({"type": "done"})

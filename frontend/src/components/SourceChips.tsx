@@ -41,7 +41,9 @@ export function SourceChips({ sources, onActivate, expandedNodeIds }: Props) {
                 onClick={() => onActivate(s.node_id)}
                 className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium border cursor-pointer transition-colors ${active ? colors.active : colors.inactive}`}
               >
-                <span className={`font-mono text-[10px] ${active ? 'opacity-90' : 'opacity-50'}`}>[{s.citation_index}]</span>
+                {s.citation_indices.map((idx) => (
+                  <span key={idx} className={`font-mono text-[10px] ${active ? 'opacity-90' : 'opacity-50'}`}>[{idx}]</span>
+                ))}
                 <span className="font-semibold">{s.ticker}</span>
                 <span className={active ? 'opacity-90' : 'opacity-70'}>{s.filing_type}</span>
                 <span className={active ? 'opacity-90' : 'opacity-70'}>FY{s.fiscal_year}</span>

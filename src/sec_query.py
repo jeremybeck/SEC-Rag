@@ -3,7 +3,7 @@ sec_query.py — Single-LLM-call RAG engine for SEC EDGAR filings.
 
 Pipeline (1 LLM call total):
   1. _retrieve_nodes — dense vector retrieval via pgvector ANN (no LLM)
-  2. _synthesize — single LLM call; returns (answer_text, cited_node_ids)
+  2. _synthesize — single LLM call; returns SynthesisResult with answer, citations, and confidence
 
 Chunk enrichment (not metadata filters) drives retrieval precision.
 Each indexed chunk starts with a self-describing header:
@@ -99,7 +99,7 @@ class SecQueryEngine:
         max_synthesis_nodes: int   = 50,
         mmr_lambda:          float = 0.5,
         mmr_soft_cap:        int   = 5,
-        prompt_file:         str   = "synthesis_v2.txt",
+        prompt_file:         str   = "synthesis_v3.txt",
     ):
         self.index                = index
         self.top_k                = top_k

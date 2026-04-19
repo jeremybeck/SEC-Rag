@@ -3,7 +3,7 @@ sec_query.py — Single-LLM-call RAG engine for SEC EDGAR filings.
 
 Pipeline (1 LLM call total):
   1. _retrieve_nodes — dense vector retrieval via pgvector ANN (no LLM)
-  2. _synthesize_stream — single LLM call to answer the question from retrieved context
+  2. _synthesize — single LLM call; returns (answer_text, cited_node_ids)
 
 Chunk enrichment (not metadata filters) drives retrieval precision.
 Each indexed chunk starts with a self-describing header:
@@ -16,7 +16,9 @@ Basic usage:
 """
 
 import asyncio
+import json
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import AsyncGenerator
@@ -66,7 +68,7 @@ class SecQueryEngine:
         max_synthesis_nodes: int   = 50,
         mmr_lambda:          float = 0.5,
         mmr_soft_cap:        int   = 5,
-        prompt_file:         str   = "synthesis_v1.txt",
+        prompt_file:         str   = "synthesis_v2.txt",
     ):
         self.index                = index
         self.top_k                = top_k
@@ -247,16 +249,51 @@ class SecQueryEngine:
         context = "\n\n---\n\n".join(context_parts)
         return self._prompt_template.format(query=query, context=context)
 
-    def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> str:
-        """Single LLM call to produce a final answer from retrieved nodes."""
+    def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> tuple[str, list[str]]:
+        """Single LLM call; returns (answer_text, cited_node_ids)."""
         prompt = self._build_synthesis_prompt(query, nodes)
         response = Settings.llm.complete(prompt)
-        return response.text.strip()
+        return self._parse_synthesis_response(response.text.strip(), nodes)
 
+    def _parse_synthesis_response(
+        self, text: str, nodes: list[NodeWithScore]
+    ) -> tuple[str, list[str]]:
+        """
+        Parse the JSON synthesis response into (answer_text, cited_node_ids).
+
+        Tries strict JSON parse first; falls back to regex extraction of the
+        outermost {...} block (handles markdown fences or stray preamble).
+        If both fail, returns (raw_text, []) so the caller always gets a string.
+        """
+        parsed = None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if parsed is None:
+            print("[SecQueryEngine] WARNING: could not parse JSON response — returning raw text")
+            return text, []
+
+        answer = parsed.get("answer", text)
+        raw_citations = parsed.get("citations", [])
+        cited_node_ids = [
+            nodes[i - 1].node_id
+            for i in raw_citations
+            if isinstance(i, int) and 1 <= i <= len(nodes)
+        ]
+        return answer, cited_node_ids
+
+    # NOTE: no longer called by the server; retained for potential direct use.
     async def _synthesize_stream(
         self, query: str, nodes: list[NodeWithScore]
     ) -> AsyncGenerator[str, None]:
-        """Streaming variant of _synthesize — yields tokens as they arrive."""
+        """Streaming variant — yields raw tokens. Does not parse citations."""
         prompt = self._build_synthesis_prompt(query, nodes)
         async for chunk in await Settings.llm.astream_complete(prompt):
             if chunk.delta:
@@ -317,5 +354,5 @@ class _DynamicSecQueryEngine(BaseQueryEngine):
         nodes = await self._sec._retrieve_nodes(query_str)
         if self._sec.verbose:
             print(f"[Nodes retrieved] {len(nodes)}")
-        answer = self._sec._synthesize(query_str, nodes)
+        answer, _ = self._sec._synthesize(query_str, nodes)
         return Response(response=answer)

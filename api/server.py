@@ -6,7 +6,7 @@ Exposes a single POST /query endpoint that streams results as Server-Sent Events
 Events (in order):
   {"type": "plan",    "data": {tickers, years, filing_types, reasoning}}
   {"type": "nodes",   "data": [{node_id, ticker, filing_type, fiscal_year, fiscal_quarter, section_label, score, text_preview}]}
-  {"type": "token",   "data": "<token>"}   (one per streamed token)
+  {"type": "token",   "data": "<answer>"}  (one event containing the complete answer)
   {"type": "sources", "data": [{ticker, filing_type, fiscal_year, section_label, node_id}]}
   {"type": "done"}
   {"type": "error",   "data": "<message>"}  (on exception)
@@ -89,14 +89,17 @@ async def query_endpoint(request: Request, body: QueryRequest):
                 })
             yield _event({"type": "nodes", "data": nodes_payload})
 
-            # Stage 3: Stream synthesis tokens
-            async for token in engine._synthesize_stream(query, nodes):
-                yield _event({"type": "token", "data": token})
+            # Stage 3: Synthesize answer (single LLM call; returns cited node IDs)
+            answer, cited_node_ids = engine._synthesize(query, nodes)
+            yield _event({"type": "token", "data": answer})
 
-            # Stage 4: Sources (deduplicated)
+            # Stage 4: Sources — only nodes actually cited in the answer
+            cited_set = set(cited_node_ids)
             seen_sources = set()
             sources = []
             for n in nodes:
+                if n.node_id not in cited_set:
+                    continue
                 m = n.node.metadata
                 key = (m.get("ticker"), m.get("filing_type"), m.get("fiscal_year"), m.get("section_label"))
                 if key not in seen_sources:

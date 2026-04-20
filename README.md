@@ -59,10 +59,10 @@ source .venv/bin/activate
 
 ### 2. Download the spaCy language model
 
-The query engine uses spaCy to extract company names and ticker symbols from queries. The model must be downloaded once after install:
+The query engine uses spaCy to extract company names and ticker symbols from queries. The model must be installed once after setup:
 
 ```bash
-uv run python -m spacy download en_core_web_sm
+uv pip install en-core-web-sm
 ```
 
 ### 3. Prepare the corpus

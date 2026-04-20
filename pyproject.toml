@@ -3,4 +3,16 @@ name = "sec-rag"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "asyncpg>=0.29",
+    "fastapi==0.136.0",
+    "llama-index==0.12.52",
+    "llama-index-question-gen-openai==0.3.1",
+    "llama-index-vector-stores-postgres==0.5.5",
+    "psycopg2-binary==2.9.11",
+    "sentence-transformers>=0.29",
+    "spacy>=3.7",
+    "sse-starlette==3.3.4",
+    "torch==2.11.0",
+    "uvicorn[standard]==0.44.0",
+]

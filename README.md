@@ -1,6 +1,8 @@
 # SEC-Rag
 SEC Filings RAG Application — query SEC 10-K/10-Q filings using LlamaIndex and pgvector.
 
+![SEC-Rag screenshot](docs/assets/SEC_RAG.png)
+
 ## Architecture
 
 ```mermaid

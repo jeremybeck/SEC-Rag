@@ -54,17 +54,23 @@ The primary retrieval mechanism is approximate nearest-neighbor (ANN) search ove
 
 Relying just on semantic similarity is not necessarily the ideal, but aligns with the single LLM call constraint, which precludes efficient decomposition and metadata generation.  To support semantic retrieval across companies, the company and period context is in the embedding itself.
 
-### Year-based metadata pre-filtering
+### Metadata pre-filtering
 
-A lightweight heuristic extracts fiscal year signals from the query before the ANN search:
+Two lightweight heuristics extract structured signals from the query and apply them as pgvector metadata filters before the ANN search runs. This prevents unrelated filings from consuming candidate slots before the reranker and MMR stages can act.
 
-- **Explicit years** (`"2024"`, `"fiscal year 2025"`) → filter to those years
+**Year filtering** (`extract_year_filters` in `sec_query.py`):
+- **Explicit years** (`"2024"`, `"fiscal year 2025"`) → filter to those exact years
 - **Relative spans** (`"last 3 years"`, `"past two years"`) → expand to the N most recent years
 - **Recency signals** (`"recent"`, `"latest"`, `"current"`) → last 2 years
 
-When a year signal is detected, a `fiscal_year` metadata filter is applied at the pgvector query level. This prevents older filings from displacing current-year chunks in the ANN results — a common failure mode when multiple filing years exist for the same company.
+When a year signal is detected, a `fiscal_year` metadata filter is applied at the pgvector query level. Synthesis evaluation of year-agnostic queries (Stratum D) showed the highest faithfulness degradation — wrong-year chunks consistently entered the context when no filter was applied. This motivated the year filter.
 
-If no year signal is found, no filter is applied and retrieval remains fully open.
+**Ticker filtering** (`company_matcher.py`, spaCy PhraseMatcher):
+When a query names specific companies, a `ticker` metadata filter restricts the candidate pool to only those companies' filings. The matcher resolves both ticker symbols (`AAPL`) and company names (`Apple`, `Apple Inc.`, `Apple Computer`) to their canonical tickers, using spaCy's PhraseMatcher for fast substring detection.
+
+When both year and ticker signals are present, the two OR-groups are ANDed: `(year=2024 OR year=2025) AND (ticker=AAPL OR ticker=TSLA)`.
+
+If neither signal is found, no filter is applied and retrieval remains fully open.
 
 ### The diversity problem
 
@@ -78,19 +84,31 @@ After ANN retrieval, a cross-encoder model (`cross-encoder/ms-marco-MiniLM-L-6-v
 
 Scores are sigmoid-normalized to [0, 1] for interpretability.
 
-### Ticker-aware MMR diversity selection
+### Balanced quota diversity selection
 
-The final selection stage is a greedy Maximal Marginal Relevance (MMR) variant that enforces company diversity. At each step it scores candidates by:
+The final selection stage enforces company diversity by assigning each represented ticker a guaranteed minimum chunk allocation before selecting on relevance.
 
+The initial approach used a soft-penalty MMR variant that ramped down scores for over-represented companies. This failed in practice because the reranker's `top_n` pool was being cut to the final synthesis count *before* diversity selection ran. For a 3-company query where one company's filings dominated the corpus, the reranker eliminated the other companies' candidates entirely — leaving the diversity stage nothing to balance. Observed distribution: `{'JPM': 45, 'AAPL': 3, 'TSLA': 2}` for a 50-chunk synthesis window.
+
+**Current approach — hard balanced quota**:
+
+1. The reranker operates on a larger pool (`rerank_pool=200`) rather than the final synthesis count, preserving candidates from all companies through to the selection stage.
+
+2. Tickers are sorted ascending by candidate count (fewest candidates first), then each ticker receives a fair share of the remaining budget:
+
+```python
+for i, ticker in enumerate(ordered_by_count):
+    n_left = len(ordered) - i
+    fair   = ceil(remaining_budget / n_left)
+    quota[ticker] = min(len(candidates[ticker]), fair)
+    remaining_budget -= quota[ticker]
 ```
-score = λ × reranker_score − (1 − λ) × overrepresentation_penalty
-```
 
-The overrepresentation penalty ramps from 0 to 1 as a ticker's chunk count in the selected set approaches a soft cap (default: 5). Once a company has 5 chunks, additional chunks from that company are strongly penalized in favor of other companies.
+Within each ticker's quota, chunks are selected in descending reranker score order.
 
-With `λ = 0.5` and `soft_cap = 5`, the first five chunks from any company are chosen on pure relevance, then diversity kicks in. This produces a 50-chunk synthesis context that covers all companies mentioned in the query while still prioritizing the most relevant chunks for each.
+This guarantees roughly equal representation for all companies named in the query regardless of how many chunks each company has in the reranker pool. A company with fewer high-scoring chunks is protected from being crowded out by a company with many.
 
-The limitation is that the soft cap is a heuristic. A four-company comparison with complex sub-questions may still under-serve some companies. The principled solution — query decomposition followed by per-company retrieval — would require additional LLM calls.
+The tradeoff is that a focused single-company query now receives a lower average chunk relevance than it would under pure relevance sorting — some slots go to lower-scoring chunks from a single company. In practice this is acceptable: single-company queries still saturate their quota with high-scoring material.
 
 ---
 
@@ -122,19 +140,27 @@ Each citation carries the original chunk index and a verbatim quote — the spec
 
 Citation numbers in the answer are renumbered by first appearance, so the user sees `[1], [2], [3]...` regardless of which position in the 50-chunk context each source held.
 
-### Confidence self-assessment and its limitations
+### NLI faithfulness scoring (post-hoc)
 
-The model is asked to rate its own answer confidence (HIGH/MEDIUM/LOW) and explain the rating. The intent is to surface cases where the context was insufficient or the wrong documents were retrieved.
+After synthesis, a `cross-encoder/nli-deberta-v3-small` model scores each cited claim in the answer against its source excerpt independently of the LLM. This replaces the earlier approach of asking the LLM to self-rate its own confidence — which was systematically optimistic because the model cannot cleanly distinguish retrieved context from parametric memory.
 
-This is the weakest part of the synthesis design. The model has a strong tendency to rate itself HIGH because it cannot cleanly distinguish between knowledge from the provided excerpts and knowledge from its training data. When it recalls a specific financial figure from training memory, it still produces a plausible-sounding citation and rates the answer HIGH.
+**Scoring process** (`_score_faithfulness` in `sec_query.py`):
 
-Two programmatic overrides partially mitigate this:
+1. Sentence-split the answer. For each sentence containing `[N]` citation markers, find the corresponding quoted excerpts from the `citations` list.
+2. **Grounding check**: if the LLM's verbatim quote cannot be found in the raw chunk text, fall back to the first 600 characters of the raw chunk as the NLI premise. LLMs frequently paraphrase rather than copy verbatim, so this fallback ensures the NLI model always has a valid premise.
+3. Strip `[N]` markers from the hypothesis before building NLI pairs — they are out-of-distribution tokens for MNLI/SNLI-trained models and systematically reduce entailment confidence.
+4. Run batch NLI inference. Label order for this model: `[contradiction=0, neutral=1, entailment=2]`. Entailment probability = `softmax(logits)[2]`.
+5. **Numeric containment fallback**: for sentences with specific financial figures (dollar amounts, percentages, share counts), check whether those numbers appear in the source text even if NLI scores low. Tabular data like `"416.161"` in a pipe-delimited table scores near-zero on NLI semantically but is clearly grounded.
+6. Per-sentence score = `max(NLI entailment, numeric containment)`. Mean over all cited sentences.
+7. Map mean score to rating: HIGH (≥ 0.75), MEDIUM (≥ 0.45), LOW (< 0.45).
 
-1. **Number verification**: For each cited chunk, numbers appearing in the answer near that citation are checked against the full text of the cited node. If specific figures (dollar amounts, share counts, percentages) cannot be found in the source text, the rating is downgraded from HIGH to MEDIUM or LOW.
+The `DataQualityAssessment` returned by `_score_faithfulness` carries `rating`, `summary`, `missing_coverage` (sentences scoring below 0.45), and `nli_score` (raw mean float).
 
-2. **Source mismatch detection**: If the query names a company (by ticker or full name) but all cited nodes come from a different company, the rating is forced to LOW.
+**Why not LLM self-assessment?**
 
-These are heuristics, not a solution. A more reliable approach would be a separate verification pass — but that requires a second LLM call.
+Synthesis evaluation showed ~30% overconfidence when the system self-rated: the model recalled financial figures from training memory, cited a related but vague excerpt, and rated itself HIGH. The judge found the specific number absent from the cited text. Post-hoc NLI is blind to the LLM's generation process — it only measures whether the cited source text actually entails the stated claim.
+
+The NLI approach is not a complete solution: it measures sentence-level entailment of cited claims only, not correctness of uncited claims or whether the right document was retrieved in the first place.
 
 ### Prompt iterations (`src/prompts/`)
 
@@ -170,6 +196,46 @@ A `### Structured Reasoning` section was added before `### Pre-Answer Check`. It
 3. **Match filing type to question type**: annual questions → prioritize 10-K; quarterly questions → prioritize 10-Q. If a mismatch is unavoidable, flag it in `data_quality.missing_coverage`.
 4. **Enumerate before comparing**: for comparison questions, list key facts per company side-by-side and identify meaningful differences before writing the summary. This ensures comparisons are grounded in the retrieved text rather than constructed from training memory.
 
+**`synthesis_v5.txt` — enforced structured output**
+Migrating synthesis from free-text to `structured_predict` (OpenAI function-calling API via LlamaIndex) required removing the `data_quality` self-assessment block from the output schema. The LLM self-confidence assessment was replaced by the post-hoc NLI scoring described above, freeing the JSON schema to focus purely on answer quality:
+
+```json
+{
+  "answer": "prose with inline [N] citation markers",
+  "citations": [{"index": N, "quote": "verbatim phrase from excerpt N"}]
+}
+```
+
+The prompt was updated to match: the output format instructions describe only `answer` and `citations`, with `citations.quote` required to be a short verbatim extract (1–3 sentences) copied exactly from the source — not paraphrased. A `### Pre-Answer Check` section reinforces this with an explicit confabulation warning.
+
+**`synthesis_v6.txt` — mandatory multi-company coverage + comparison**
+Even with balanced retrieval delivering equal chunks per company, the LLM would write a thorough section for the company mentioned first and produce thin or absent coverage for the others. The model was "satisficing" — once it had written a complete-feeling answer for one company, it under-invested in the rest.
+
+Two structural changes in v6 addressed this:
+
+1. **Hard coverage requirement in the preamble**: "An answer that covers only a subset of the named companies is incomplete and unacceptable, even if the coverage of the ones you did address is excellent." This moves the requirement out of the reasoning steps (which the model can skip) into the instruction framing.
+
+2. **Mandatory coverage audit (Step 6)**: After drafting the answer mentally, the model must check each named company off a list before writing JSON. If a company has no relevant excerpts, the answer must explicitly state this rather than silently omitting it.
+
+3. **Comparison paragraph (Step 5)**: When the question contains comparison language ("compare", "contrast", "how do they differ", "versus", "similarities and differences"), the model is required to draft a dedicated `**Comparison**` paragraph after the per-company paragraphs. The paragraph must synthesize only facts already cited above — no new claims — and explicitly name the key similarities and differences. The Step 6 audit includes a checkbox for this paragraph.
+
+### Streaming synthesis
+
+`structured_predict` blocks until the LLM has generated the full JSON response, which means the user sees nothing for 5–15 seconds. To improve perceived latency, synthesis was converted to an SSE streaming architecture:
+
+1. The server emits `filters` and `nodes` SSE events before the LLM call begins, so the retrieved documents sidebar populates immediately.
+2. `_synthesize_streaming` calls `Settings.llm.astream_complete(prompt)` and runs a character-level state machine over the token stream:
+   - **SCANNING**: accumulates a sliding window looking for `"answer":` in the raw JSON stream
+   - **IN_ANSWER**: yields each character (handling JSON escape sequences: `\n`, `\"`, `\\`, etc.) until the closing unescaped `"`
+   - **DONE**: discards remaining tokens while still buffering them
+3. Each yielded character is wrapped as a `{"type": "token", "data": "<char>"}` SSE event. The frontend appends tokens to the answer as they arrive.
+4. After streaming completes, the buffered full response is `json.loads()`-parsed to extract citations. The same renumbering and NLI scoring logic as the non-streaming path runs at this point.
+5. A final `{"type": "answer", "data": "<remapped_answer>"}` SSE event replaces the streamed content with the citation-renumbered version (original chunk indices like `[15]` replaced with display-order `[1]`, `[2]`, `[3]`).
+
+The tradeoff: the user sees the raw chunk indices during streaming, then sees a brief correction when the remapped answer arrives. This is preferable to waiting for the full response.
+
+NLI scoring still happens after streaming on the blocking path (it cannot be streamed), so the quality assessment and source chips appear after a short delay following the end of the answer stream.
+
 ### Context window tradeoff
 
 Sending 50 chunks to the model maximizes the chance that every company relevant to a comparative question is represented. The tradeoff is that the model must attend over a large, heterogeneous context — 50 chunks from potentially 8–10 different companies and filing years — in a single pass.
@@ -184,6 +250,9 @@ This is inherently harder than a focused single-company query. The prompt includ
 |-----------------------------------|---|---|
 | Chunk enrichment                  | No planning LLM call needed | Larger chunks, more tokens per embedding call |
 | 800-token chunks                  | Coherent analytical context | Fewer chunks fit in synthesis window |
-| Single LLM call                   | Low latency, simple architecture | Model must do retrieval quality assessment + answer generation simultaneously |
-| Ticker-aware chunk selection      | Comparative questions work | May under-serve any one company vs. a focused query |
-| Cross-encoder reranking           | Precision improvement | ~200ms local inference latency added |
+| Single LLM call                   | Low latency, simple architecture | Model must handle answer generation + citation in one pass |
+| Metadata pre-filtering (year + ticker) | Eliminates wrong-period and wrong-company chunks before ANN search | Requires heuristic query parsing; false positives over-restrict retrieval |
+| Cross-encoder reranking           | Precision improvement over cosine similarity | ~200ms local inference latency added |
+| Balanced quota MMR                | Guaranteed per-company coverage for comparative queries | Single-company queries receive lower average chunk relevance |
+| NLI post-hoc faithfulness         | Objective, reproducible faithfulness signal independent of LLM | Sentence-level only; doesn't catch uncited fabrications or wrong-document retrieval |
+| Streaming synthesis               | Answer appears immediately; nodes sidebar updates before LLM call | Citation indices shown during streaming are raw; corrected after stream ends |

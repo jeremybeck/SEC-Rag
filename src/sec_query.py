@@ -42,6 +42,23 @@ from pydantic import BaseModel
 
 CURRENT_YEAR: int = datetime.date.today().year
 
+# Lazy-loaded DeBERTa NLI model for post-hoc faithfulness scoring
+_nli_model = None
+
+def _get_nli_model():
+    """
+    Lazy-load and cache the DeBERTa NLI cross-encoder.
+
+    Downloads the model from HuggingFace on first call (~22 MB); subsequent
+    calls return the cached instance. Thread-safe for read access after initial load.
+    Label order: [contradiction=0, neutral=1, entailment=2].
+    """
+    global _nli_model
+    if _nli_model is None:
+        from sentence_transformers import CrossEncoder
+        _nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small")
+    return _nli_model
+
 
 class Citation(BaseModel):
     """A single citation: the chunk index and the verbatim quote from that chunk."""
@@ -50,17 +67,17 @@ class Citation(BaseModel):
 
 
 class DataQualityAssessment(BaseModel):
-    """LLM-generated assessment of how well the retrieved context covers the question."""
+    """Post-hoc NLI faithfulness assessment of the synthesized answer."""
     rating:           Literal["HIGH", "MEDIUM", "LOW"]
     summary:          str
     missing_coverage: list[str]
+    nli_score:        float | None = None
 
 
 class SynthesisResponse(BaseModel):
     """Structured output schema for the synthesis LLM call."""
-    answer:       str
-    citations:    list[Citation]
-    data_quality: DataQualityAssessment
+    answer:    str
+    citations: list[Citation]
 
 
 @dataclass
@@ -70,6 +87,15 @@ class SynthesisResult:
     cited_node_ids: list[str]
     cited_quotes:   list[str]
     data_quality:   DataQualityAssessment | None
+
+
+@dataclass
+class RetrievalResult:
+    """Return value from _retrieve_nodes — nodes plus the metadata filters that were applied."""
+    nodes:      list  # list[NodeWithScore]
+    tickers:    list[str]
+    years:      list[int]
+    industries: list[str]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,63 +131,63 @@ def extract_year_filters(query: str) -> list[int] | None:
     return list(years) if years else None
 
 
-def extract_company_filters(query: str) -> list[str] | None:
-    """
-    Extract ticker symbols from a query (handles both symbols and full names).
-
-    Ticker symbols: matched as uppercase sequences (e.g. "AAPL", "JPM").
-    Company names: whole-word matched against words >= 5 chars from TICKER_NAMES
-    (e.g. "Apple", "Google", "Johnson") to avoid false positives on short fragments.
-
-    Returns a sorted list of uppercase tickers, or None if no company found.
-    """
-    try:
-        from filing_parser import TICKER_NAMES
-    except ImportError:
-        return None
-
-    # Map from unambiguous company name words (>= 5 chars) to ticker.
-    # Short tickers (< 3 chars) like "T", "V", "MA" are too ambiguous for
-    # word-based matching — they are caught by the uppercase regex below.
-    name_map: dict[str, str] = {}
-    for ticker, name in TICKER_NAMES.items():
-        for word in name.lower().split():
-            # Strip punctuation like "&" from "AT&T", skip short words
-            clean = re.sub(r'[^a-z]', '', word)
-            if len(clean) >= 5:
-                name_map[clean] = ticker
-
-    found: set[str] = set()
-
-    # Match known ticker symbols appearing as uppercase tokens in the query
-    for m in re.finditer(r'\b([A-Z]{2,5})\b', query):
-        candidate = m.group(1)
-        if candidate in TICKER_NAMES:
-            found.add(candidate)
-
-    # Match company name words as whole words (not substrings)
-    for word, ticker in name_map.items():
-        if re.search(r'\b' + word + r'\b', query, re.IGNORECASE):
-            found.add(ticker)
-
-    return sorted(found) if found else None
-
-
 def build_metadata_filters(query: str) -> MetadataFilters | None:
     """
-    Build LlamaIndex MetadataFilters from fiscal year signals in a query.
+    Build LlamaIndex MetadataFilters from fiscal year and company signals in a query.
 
-    Year filters use fiscal_year (int), ORed together.
-    Returns None if no year signal is found (no pre-filtering applied).
+    Year filters  — fiscal_year (int), ORed together.
+    Ticker filters — ticker (str), ORed together, via spaCy PhraseMatcher.
+
+    When both are present, the two OR-groups are ANDed:
+        (year=2024 OR year=2025) AND (ticker=AAPL OR ticker=MSFT)
+
+    Returns None if neither signal is found (no pre-filtering applied).
     """
-    years = extract_year_filters(query)
-    if not years:
+    from company_matcher import match_query
+
+    years   = extract_year_filters(query)
+    matches = match_query(query)
+    tickers = matches["tickers"]
+
+    if not years and not tickers:
         return None
 
+    if years and tickers:
+        # Nested OR groups ANDed together
+        return MetadataFilters(
+            filters=[
+                MetadataFilters(
+                    filters=[
+                        MetadataFilter(key="fiscal_year", value=y, operator=FilterOperator.EQ)
+                        for y in years
+                    ],
+                    condition=FilterCondition.OR,
+                ),
+                MetadataFilters(
+                    filters=[
+                        MetadataFilter(key="ticker", value=t, operator=FilterOperator.EQ)
+                        for t in tickers
+                    ],
+                    condition=FilterCondition.OR,
+                ),
+            ],
+            condition=FilterCondition.AND,
+        )
+
+    if years:
+        return MetadataFilters(
+            filters=[
+                MetadataFilter(key="fiscal_year", value=y, operator=FilterOperator.EQ)
+                for y in years
+            ],
+            condition=FilterCondition.OR,
+        )
+
+    # tickers only
     return MetadataFilters(
         filters=[
-            MetadataFilter(key="fiscal_year", value=y, operator=FilterOperator.EQ)
-            for y in years
+            MetadataFilter(key="ticker", value=t, operator=FilterOperator.EQ)
+            for t in tickers
         ],
         condition=FilterCondition.OR,
     )
@@ -179,15 +205,20 @@ class SecQueryEngine:
     Parameters
     ----------
     index : VectorStoreIndex
-        Your pre-built LlamaIndex vector store (from pgvector).
+        Pre-built LlamaIndex vector store (from pgvector).
     top_k : int
-        Candidates to fetch from ANN search before reranking (default 50).
+        ANN candidates fetched from pgvector before reranking (default 2500).
+    rerank_pool : int
+        Cross-encoder rerank pool size (default 200). Pre-rerank step guarantees
+        rerank_per_ticker nodes per company in this pool.
+    rerank_per_ticker : int
+        Minimum candidates per ticker in the rerank pool (default 15).
+    max_synthesis_nodes : int
+        Final chunks passed to the LLM, allocated evenly across tickers (default 50).
     verbose : bool
-        Print retrieval summary (default True).
+        Print per-stage retrieval stats (default True).
     debug : bool
         Attach LlamaDebugHandler for detailed tracing (default False).
-    max_synthesis_nodes : int
-        Maximum chunks passed to the synthesis LLM (default 20).
     """
 
     _PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -201,9 +232,7 @@ class SecQueryEngine:
         rerank_pool:         int   = 200,
         rerank_per_ticker:   int   = 15,
         max_synthesis_nodes: int   = 50,
-        mmr_lambda:          float = 0.5,
-        mmr_soft_cap:        int   = 5,
-        prompt_file:         str   = "synthesis_v4.txt",
+        prompt_file:         str   = "synthesis_v6.txt",
     ):
         self.index                = index
         self.top_k                = top_k
@@ -211,8 +240,6 @@ class SecQueryEngine:
         self.max_synthesis_nodes  = max_synthesis_nodes
         self._rerank_pool         = rerank_pool
         self._rerank_per_ticker   = rerank_per_ticker
-        self._mmr_lambda          = mmr_lambda
-        self._mmr_soft_cap        = mmr_soft_cap
         self._prompt_template     = (self._PROMPTS_DIR / prompt_file).read_text()
 
         if debug:
@@ -222,13 +249,19 @@ class SecQueryEngine:
             self._debug_handler = None
 
         # Cross-encoder reranker (~22 MB download on first use)
-        # top_n matches max_synthesis_nodes so the reranker produces exactly the final set
+        # top_n = rerank_pool so the reranker scores the full candidate pool;
+        # the balanced ticker selection (_mmr_diversity_select) does the final cut.
         self._reranker = SentenceTransformerRerank(
             model="cross-encoder/ms-marco-MiniLM-L-6-v2",
-            top_n=max_synthesis_nodes,
+            top_n=rerank_pool,
         )
         # Drop nodes below cosine similarity 0.72 before reranking
         self._sim_filter = SimilarityPostprocessor(similarity_cutoff=0.40)
+
+        # Pre-load NLI model at startup so the first query doesn't pay the download cost
+        _get_nli_model()
+        if self.verbose:
+            print("[SecQueryEngine] NLI faithfulness model loaded.")
 
         if self.verbose:
             print("[SecQueryEngine] Ready.")
@@ -239,29 +272,61 @@ class SecQueryEngine:
 
     async def query(self, query: str) -> str:
         """Run a natural-language query against the SEC corpus."""
-        nodes = await self._retrieve_nodes(query)
-        if self.verbose:
-            print(f"[SecQueryEngine] {len(nodes)} nodes after retrieval pipeline")
-        return self._synthesize(query, nodes)
+        retrieval = await self._retrieve_nodes(query)
+        return self._synthesize(query, retrieval.nodes)
+
+    def parse_query_filters(self, query: str) -> dict:
+        """
+        Fast, synchronous extraction of tickers/years/industries from a query.
+        No I/O — just spaCy phrase matching and regex. Used to emit filter metadata
+        to the client before the slower retrieval pipeline begins.
+        """
+        from company_matcher import match_query as _cm
+        matches = _cm(query)
+        years   = extract_year_filters(query) or []
+        return {
+            "tickers":    matches["tickers"],
+            "years":      years,
+            "industries": matches["industries"],
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _retrieve_nodes(self, query: str) -> list[NodeWithScore]:
+    async def _retrieve_nodes(self, query: str) -> "RetrievalResult":
         """
-        Dense vector retrieval — no metadata filters, no LLM calls.
+        Full retrieval pipeline — ANN search → dedup → sim filter → reranking → MMR.
 
-        Relies on chunk enrichment (company/year/section prefix in chunk text)
-        to surface relevant passages via cosine similarity.
+        No LLM calls. Returns a RetrievalResult containing the final ranked nodes
+        plus the tickers/years/industries extracted from the query (used to emit
+        filter metadata to the client before synthesis begins).
+
+        Pipeline stages:
+          1. Extract company/year metadata filters via spaCy + regex
+          2. pgvector ANN search (top_k candidates with optional metadata pre-filter)
+          3. Deduplicate by node_id
+          4. Drop nodes below similarity floor (unless that would leave nothing)
+          5. Per-ticker quota → cross-encoder rerank pool
+          6. Cross-encoder reranking + sigmoid score normalisation
+          7. Ticker-aware MMR diversity selection → final max_synthesis_nodes
         """
+        from company_matcher import match_query as _cm
+        _matches = _cm(query)
+        _years   = extract_year_filters(query)
         metadata_filters = build_metadata_filters(query)
+        if self.verbose:
+            print(
+                f"[Retrieval] entity extraction — "
+                f"years={_years or 'none'}  "
+                f"tickers={_matches['tickers'] or 'none'}  "
+                f"industries={_matches['industries'] or 'none'}  "
+                f"filter={'applied' if metadata_filters else 'none'}"
+            )
         retriever = self.index.as_retriever(
             similarity_top_k=self.top_k,
             filters=metadata_filters,
         )
-        if self.verbose and metadata_filters is not None:
-            print(f"[Retrieval] metadata filter — years={extract_year_filters(query)}")
         nodes = await retriever.aretrieve(query)
 
         # Deduplicate by node_id
@@ -339,51 +404,71 @@ class SecQueryEngine:
         if self.verbose:
             print(f"[SecQueryEngine] {len(nodes)} nodes passed to synthesis")
 
-        return nodes
+        return RetrievalResult(
+            nodes=nodes,
+            tickers=_matches["tickers"],
+            years=_years or [],
+            industries=_matches["industries"],
+        )
 
     def _mmr_diversity_select(self, nodes: list[NodeWithScore]) -> list[NodeWithScore]:
         """
-        Greedy MMR that balances reranker relevance with ticker diversity.
+        Balanced ticker selection: guarantees a fair share of synthesis context
+        for every company present in the candidate pool.
 
-        Each step selects the candidate that maximises:
-            mmr_lambda * reranker_score  -  (1 - mmr_lambda) * overrepresentation_penalty
+        Algorithm:
+          1. Group nodes by ticker, sorted by reranker score (best first).
+          2. Process tickers from smallest available count to largest, so
+             under-represented companies claim their slot before the dominant one.
+          3. Each ticker's quota = min(available, ceil(remaining_budget / n_tickers_left)).
+             Slack from exhausted tickers flows to the remaining ones.
+          4. Take the top-quota nodes (by reranker score) from each ticker.
+          5. Sort the final set by reranker score so synthesis sees the most
+             relevant chunks first regardless of company.
 
-        overrepresentation_penalty = min(chunks_already_selected_for_ticker / mmr_soft_cap, 1.0)
-
-        With mmr_lambda=0.5 and mmr_soft_cap=5, the first 5 chunks from any
-        company are chosen on pure relevance; beyond that, penalty ramps to 1.0
-        and other companies' chunks are strongly preferred.
+        Example with 3 tickers and max_synthesis_nodes=50:
+          TSLA(2 available), AAPL(15), JPM(170)
+          → TSLA gets 2, AAPL gets 15, JPM gets 33  → 50 total
+          Instead of the previous 2 + 3 + 45 output.
         """
         from collections import Counter, defaultdict
 
+        # Group by ticker, each list sorted best-first
+        by_ticker: dict[str, list[NodeWithScore]] = defaultdict(list)
+        for n in sorted(nodes, key=lambda x: float(x.score or 0.0), reverse=True):
+            by_ticker[n.node.metadata.get("ticker", "")].append(n)
+
+        # Process smallest-available tickers first so they get their fair share
+        ordered = sorted(by_ticker.keys(), key=lambda t: len(by_ticker[t]))
+        remaining_budget = self.max_synthesis_nodes
+        quota: dict[str, int] = {}
+        for i, ticker in enumerate(ordered):
+            n_left = len(ordered) - i
+            fair   = math.ceil(remaining_budget / n_left)
+            quota[ticker] = min(len(by_ticker[ticker]), fair)
+            remaining_budget -= quota[ticker]
+
         selected: list[NodeWithScore] = []
-        candidates = list(nodes)
-        ticker_counts: dict[str, int] = defaultdict(int)
+        for ticker in ordered:
+            selected.extend(by_ticker[ticker][: quota[ticker]])
 
-        while len(selected) < self.max_synthesis_nodes and candidates:
-            best_score = -float("inf")
-            best_idx   = 0
-            for i, n in enumerate(candidates):
-                relevance = float(n.score or 0.0)
-                ticker    = n.node.metadata.get("ticker", "")
-                penalty   = min(ticker_counts[ticker] / self._mmr_soft_cap, 1.0)
-                combined  = self._mmr_lambda * relevance - (1 - self._mmr_lambda) * penalty
-                if combined > best_score:
-                    best_score = combined
-                    best_idx   = i
-
-            chosen = candidates.pop(best_idx)
-            selected.append(chosen)
-            ticker_counts[chosen.node.metadata.get("ticker", "")] += 1
+        # Re-sort by reranker score so LLM sees highest-confidence chunks first
+        selected.sort(key=lambda x: float(x.score or 0.0), reverse=True)
 
         if self.verbose:
             dist = dict(Counter(n.node.metadata.get("ticker") for n in selected))
-            print(f"[MMR] {len(selected)} nodes — ticker distribution: {dist}")
+            print(f"[Balanced] {len(selected)} nodes — ticker distribution: {dist}")
 
         return selected
 
     def _build_synthesis_prompt(self, query: str, nodes: list[NodeWithScore]) -> str:
-        """Build the single synthesis prompt from retrieved chunks."""
+        """
+        Assemble the synthesis prompt by numbering each retrieved chunk [1], [2], …
+        and substituting into the loaded prompt template.
+
+        The numbered format is what the LLM uses when writing inline citations,
+        and what _score_faithfulness uses to map [N] markers back to source nodes.
+        """
         context_parts = []
         for i, n in enumerate(nodes, 1):
             context_parts.append(f"[{i}]\n{n.node.get_content()}")
@@ -394,96 +479,184 @@ class SecQueryEngine:
             .replace("{context}", context)
         )
 
-    # word/ticker fragment → canonical ticker, built once at class level
-    _NAME_TO_TICKER: dict[str, str] = {}
-    _ALL_TICKERS:    set[str]        = set()
-
-    @classmethod
-    def _build_name_map(cls) -> None:
-        """Populate _NAME_TO_TICKER and _ALL_TICKERS from filing_parser.TICKER_NAMES."""
-        if cls._NAME_TO_TICKER:
-            return
-        try:
-            from filing_parser import TICKER_NAMES
-            for ticker, name in TICKER_NAMES.items():
-                cls._ALL_TICKERS.add(ticker)
-                cls._NAME_TO_TICKER[ticker.lower()] = ticker
-                for word in name.lower().split():
-                    if len(word) >= 4:
-                        cls._NAME_TO_TICKER[word] = ticker
-        except ImportError:
-            pass
-
-    def _check_claimed_numbers(
+    def _score_faithfulness(
         self,
         answer: str,
         citations: list[Citation],
         nodes: list[NodeWithScore],
-    ) -> list[int]:
+    ) -> DataQualityAssessment:
         """
-        For each [N] citation in the answer, find numbers claimed in nearby text
-        and verify they appear in node N's full text.
+        Post-hoc faithfulness scoring via DeBERTa NLI.
 
-        Returns original citation indices where claimed numbers cannot be found
-        in the source node — indicating the model drew on training knowledge
-        rather than the provided excerpt.
+        Premise  = the verbatim quote the LLM provided for each citation.
+                   Short, targeted, and the right length for NLI models trained
+                   on SNLI/MNLI. Also verified to actually appear in the raw chunk.
+        Hypothesis = the answer sentence containing that citation marker.
 
-        Number patterns matched: dollar amounts, comma-separated figures,
-        and numbers followed by billion/million/thousand/%.
+        For each cited sentence:
+          - Finds all [N] markers and their associated citation quotes.
+          - Runs NLI: (quote, sentence) for each citation.
+          - Takes MAX entailment across all citations for that sentence.
+            (A sentence passes if supported by any of its cited quotes.)
+
+        Additionally checks quote grounding: if a citation quote is not found
+        in the raw chunk text, that citation is flagged as ungrounded.
+
+        Final score = mean of per-sentence max scores → HIGH / MEDIUM / LOW.
+        Model: cross-encoder/nli-deberta-v3-small.
+        Output logit order: [contradiction, entailment, neutral].
         """
-        number_pat = re.compile(
-            r'\$[\d,]+(?:\.\d+)?(?:\s*(?:billion|million|thousand|B|M))?'
-            r'|\b\d+(?:,\d{3})+(?:\.\d+)?\b'
-            r'|\b\d+(?:\.\d+)?\s*(?:billion|million|thousand|%)',
-            re.IGNORECASE,
-        )
+        import math
+
         citation_pat = re.compile(r'\[(\d+)\]')
+        quote_map: dict[int, str] = {c.index: c.quote for c in citations}
+        valid_indices = set(quote_map)
 
-        valid_orig = {c.index for c in citations}
-        cit_positions = [
-            (m.start(), int(m.group(1)))
-            for m in citation_pat.finditer(answer)
-            if int(m.group(1)) in valid_orig
-        ]
-        if not cit_positions:
-            return []
+        # Split answer into sentences
+        raw_sentences = re.split(r'(?<=[.!?])\s+|\n+', answer.strip())
+        sentences = [s.strip() for s in raw_sentences if s.strip()]
 
-        unverified: set[int] = set()
+        # For each sentence with citations, collect (quote, sentence) pairs.
+        # A sentence may cite multiple chunks — it passes if ANY quote entails it.
+        sentence_groups: list[tuple[str, list[str]]] = []  # (sentence, [quotes])
+        ungrounded_flags: list[str] = []
 
-        for nm in number_pat.finditer(answer):
-            num_str = nm.group(0)
-            pos     = nm.start()
-
-            # Find nearest valid [N] within 300 chars before or 100 chars after
-            nearest_idx, best_dist = None, 9999
-            for cpos, cidx in cit_positions:
-                if cpos <= pos:
-                    d = pos - cpos
-                    if d <= 300 and d < best_dist:
-                        best_dist, nearest_idx = d, cidx
-                else:
-                    d = cpos - pos
-                    if d <= 100 and d < best_dist:
-                        best_dist, nearest_idx = d, cidx
-
-            if nearest_idx is None or not (1 <= nearest_idx <= len(nodes)):
+        for sentence in sentences:
+            cited_indices = [
+                int(m.group(1))
+                for m in citation_pat.finditer(sentence)
+                if int(m.group(1)) in valid_indices and 1 <= int(m.group(1)) <= len(nodes)
+            ]
+            if not cited_indices:
                 continue
 
-            node_text = nodes[nearest_idx - 1].node.get_content()
-            norm_text = node_text.lower().replace(',', '').replace('$', '')
-            norm_num  = num_str.lower().replace(',', '').replace('$', '').strip()
+            quotes = []
+            for idx in cited_indices:
+                quote = quote_map.get(idx, "").strip()
+                if not quote:
+                    continue
+                # Grounding check: quote should appear verbatim in the raw chunk.
+                # If not (LLM paraphrased), fall back to the raw chunk text so NLI
+                # has a premise that actually contains the supporting information.
+                node_text = nodes[idx - 1].node.get_content()
+                if quote.lower() not in node_text.lower():
+                    flag = f"[{idx}] LLM quote not verbatim — using raw chunk as NLI premise"
+                    if flag not in ungrounded_flags:
+                        ungrounded_flags.append(flag)
+                    quote = node_text[:600]
+                quotes.append(quote)
 
-            if norm_num and len(norm_num) >= 3 and norm_num not in norm_text:
-                unverified.add(nearest_idx)
+            if quotes:
+                sentence_groups.append((sentence, quotes))
 
-        return list(unverified)
+        if not sentence_groups:
+            return DataQualityAssessment(
+                rating="LOW",
+                summary="No citation markers found in answer — faithfulness could not be assessed.",
+                missing_coverage=ungrounded_flags,
+            )
+
+        # Build flat batch of (quote, sentence) NLI pairs.
+        # Strip citation markers [N] from the hypothesis — they are out-of-distribution
+        # for MNLI/SNLI-trained NLI models and systematically reduce entailment confidence.
+        batch_pairs: list[tuple[str, str]] = []
+        group_slice: list[tuple[int, int]] = []
+
+        for sentence, quotes in sentence_groups:
+            start = len(batch_pairs)
+            clean_hyp = re.sub(r'\[\d+\]', '', sentence).strip()
+            for quote in quotes:
+                batch_pairs.append((quote, clean_hyp))
+            group_slice.append((start, len(batch_pairs)))
+
+        model = _get_nli_model()
+        logits = model.predict(batch_pairs, apply_softmax=False)  # shape (N, 3)
+
+        def _entailment(row) -> float:
+            # Label order for cross-encoder/nli-deberta-v3-small: [contradiction=0, neutral=1, entailment=2]
+            exps = [math.exp(x) for x in row]
+            return exps[2] / sum(exps)
+
+        # Numeric containment fallback: handles tabular data like "Total Net Sales| $ | 416.161 |"
+        # which the NLI model can't parse but clearly supports the claim.
+        # Extract meaningful numbers (3+ digits or decimals) from sentence, check all appear in quote.
+        _num_pat = re.compile(r'\d[\d,]*\.?\d*')
+
+        _year_pat = re.compile(r'^(19|20)\d{2}$')
+
+        def _numeric_score(sentence: str, quote: str) -> float:
+            # Normalize: strip formatting chars so "416.161" matches "| 416.161 |"
+            norm_quote = re.sub(r'[|$,%\s]', '', quote).lower()
+            # Extract financial figures — skip years (20xx/19xx) and single-digit citation indices
+            nums = [
+                re.sub(r',', '', n)
+                for n in _num_pat.findall(sentence)
+                if len(re.sub(r'[,.]', '', n)) >= 3 and not _year_pat.match(n)
+            ]
+            if not nums:
+                return 0.0
+            norm_nums = [re.sub(r'[,$]', '', n) for n in nums]
+            return 0.80 if all(n in norm_quote for n in norm_nums) else 0.0
+
+        all_probs = [_entailment(row) for row in logits]
+
+        if self.verbose and batch_pairs:
+            for i, (pair, row, prob) in enumerate(zip(batch_pairs[:3], logits[:3], all_probs[:3])):
+                print(f"[NLI debug] pair {i}: logits={[round(float(x), 3) for x in row]}  ent={prob:.3f}")
+                print(f"  premise:    {pair[0][:100]!r}")
+                print(f"  hypothesis: {pair[1][:100]!r}")
+
+        # Per sentence: take MAX across all cited quotes, combining NLI and numeric fallback
+        sentence_scores: list[float] = []
+        low_confidence_sentences: list[str] = []
+
+        for (sentence, quotes), (start, end) in zip(sentence_groups, group_slice):
+            nli_best = max(all_probs[start:end])
+            num_best = max((_numeric_score(sentence, q) for q in quotes), default=0.0)
+            best = max(nli_best, num_best)
+            sentence_scores.append(best)
+            if best < 0.45:
+                truncated = sentence[:200] + ("…" if len(sentence) > 200 else "")
+                low_confidence_sentences.append(truncated)
+
+        mean_score = sum(sentence_scores) / len(sentence_scores)
+        n_sentences = len(sentence_scores)
+
+        if mean_score >= 0.75:
+            rating = "HIGH"
+        elif mean_score >= 0.45:
+            rating = "MEDIUM"
+        else:
+            rating = "LOW"
+
+        if self.verbose:
+            print(
+                f"[NLI] faithfulness score: {mean_score:.3f} "
+                f"({n_sentences} cited sentences, {len(batch_pairs)} NLI pairs) → {rating}"
+                + (f"  ungrounded={len(ungrounded_flags)}" if ungrounded_flags else "")
+            )
+
+        sentence_word = "sentence" if n_sentences == 1 else "sentences"
+        return DataQualityAssessment(
+            rating=rating,
+            summary=f"Faithfulness checked across {n_sentences} cited {sentence_word}.",
+            missing_coverage=low_confidence_sentences + ungrounded_flags,
+            nli_score=round(mean_score, 3),
+        )
 
     def _synthesize(self, query: str, nodes: list[NodeWithScore]) -> SynthesisResult:
         """
-        Single LLM call via structured_predict.
+        Single structured LLM call that produces the final answer with citations.
 
-        Citation indices in the answer are renumbered 1-based by first appearance.
-        Returns a SynthesisResult with answer, cited_node_ids, cited_quotes, and data_quality.
+        Steps:
+          1. Build prompt from numbered chunks + synthesis_v5.txt template
+          2. structured_predict → SynthesisResponse (answer + citation list)
+          3. Renumber [N] markers 1-based by first appearance in the answer text
+          4. Post-hoc NLI faithfulness scoring via _score_faithfulness
+          5. Remap [N] indices in missing_coverage strings to display numbering
+
+        Falls back to plain text completion if structured_predict fails (e.g., JSON
+        parse error), returning no citations and no data_quality assessment.
         """
         prompt = self._build_synthesis_prompt(query, nodes)
         try:
@@ -516,83 +689,16 @@ class SecQueryEngine:
             cited_node_ids = [nodes[orig - 1].node_id for orig in seen]
             cited_quotes   = [quote_map.get(orig, "") for orig in seen]
 
-            # --- Programmatic calibration overrides ---
-            # Work on original (pre-remap) answer so citation indices match nodes directly.
-            data_quality = result.data_quality
+            # Post-hoc faithfulness scoring via DeBERTa NLI.
+            # Uses the original (pre-remap) answer so citation indices match nodes directly.
+            data_quality = self._score_faithfulness(result.answer, result.citations, nodes)
 
-            # 1. Number verification: check that specific numbers claimed near each [N]
-            #    can actually be found in node N's full text. This catches the main
-            #    confabulation pattern: model recalls a specific figure from training
-            #    knowledge, cites a related-but-different excerpt, and rates itself HIGH.
-            if data_quality is not None and result.citations:
-                unverified = self._check_claimed_numbers(
-                    result.answer, result.citations, nodes
-                )
-                n_total = len(result.citations)
-                n_bad   = len(unverified)
-                if n_bad > 0 and data_quality.rating == "HIGH":
-                    frac_bad   = n_bad / n_total
-                    new_rating = "LOW" if frac_bad > 0.5 else "MEDIUM"
-                    caveats = [
-                        f"Citation [{i}]: specific numbers in answer not found in source chunk"
-                        for i in sorted(unverified)
-                    ]
-                    data_quality = DataQualityAssessment(
-                        rating=new_rating,
-                        summary=(
-                            f"Number verification override: {n_bad}/{n_total} cited sources "
-                            f"do not contain the specific figures claimed in the answer. "
-                            f"Answer may draw on training knowledge rather than provided excerpts."
-                        ),
-                        missing_coverage=caveats,
-                    )
-                    print(
-                        f"[SecQueryEngine] Rating overridden HIGH→{new_rating}: "
-                        f"{n_bad}/{n_total} citations have unverified numbers"
-                    )
-
-            # 2. Ticker / company mismatch: if query names a company and all cited nodes
-            #    are from a different company, the answer is almost certainly from
-            #    training knowledge. Handles both ticker symbols ("JNJ") and full names
-            #    ("Johnson & Johnson").
-            if data_quality is not None and seen:
-                self._build_name_map()
-                query_lower = query.lower()
-                asked_ticker = None
-                # Try ticker symbol first (e.g. "JNJ", "GOOG") — O(1) lookup
-                tm = re.search(r'\b([A-Z]{2,5})\b', query)
-                if tm and tm.group(1) in self._ALL_TICKERS:
-                    asked_ticker = tm.group(1)
-                # Fall back to company-name word match
-                if asked_ticker is None:
-                    for word, ticker in self._NAME_TO_TICKER.items():
-                        if word in query_lower:
-                            asked_ticker = ticker
-                            break
-
-                if asked_ticker:
-                    cited_tickers_set = {
-                        nodes[orig - 1].node.metadata.get("ticker", "")
-                        for orig in seen
-                    }
-                    if cited_tickers_set and asked_ticker not in cited_tickers_set:
-                        data_quality = DataQualityAssessment(
-                            rating="LOW",
-                            summary=(
-                                f"Source mismatch: question asks about {asked_ticker} but "
-                                f"all cited sources are from "
-                                f"{', '.join(sorted(cited_tickers_set))}. "
-                                f"Answer likely drawn from training knowledge."
-                            ),
-                            missing_coverage=[
-                                f"No {asked_ticker} excerpts were cited; "
-                                f"cited sources: {', '.join(sorted(cited_tickers_set))}"
-                            ],
-                        )
-                        print(
-                            f"[SecQueryEngine] Rating overridden→LOW: company mismatch "
-                            f"(asked={asked_ticker}, cited={cited_tickers_set})"
-                        )
+            # Remap [N] indices in missing_coverage strings to match the display-order numbering.
+            if data_quality and remap:
+                data_quality.missing_coverage = [
+                    re.sub(r'\[(\d+)\]', lambda m: f"[{remap.get(int(m.group(1)), m.group(1))}]", s)
+                    for s in data_quality.missing_coverage
+                ]
 
             return SynthesisResult(
                 answer=answer,
@@ -610,15 +716,143 @@ class SecQueryEngine:
                 data_quality=None,
             )
 
-    # NOTE: no longer called by the server; retained for potential direct use.
-    async def _synthesize_stream(
+    async def _synthesize_streaming(
         self, query: str, nodes: list[NodeWithScore]
-    ) -> AsyncGenerator[str, None]:
-        """Streaming variant — yields raw tokens. Does not parse citations."""
+    ) -> AsyncGenerator["str | SynthesisResult", None]:
+        """
+        Stream the synthesis answer character by character, then yield a final SynthesisResult.
+
+        Yields:
+            str           — individual answer characters as they arrive from the LLM stream
+            SynthesisResult — one final object after the full response is complete,
+                              containing remapped citations, cited nodes, and NLI quality
+
+        Streaming approach:
+          1. Call Settings.llm.astream_complete() with the raw synthesis prompt
+          2. Run a state machine (SCANNING → IN_ANSWER → DONE) over the token stream:
+             - SCANNING: accumulate into a sliding window until '"answer":' is detected,
+               then wait for the opening '"'
+             - IN_ANSWER: yield each character, handling JSON escape sequences (\\n, \\", etc.)
+             - DONE: discard remaining tokens (still buffer for JSON parse)
+          3. After streaming, json.loads() the full buffered response to extract citations
+          4. Apply the same renumbering, NLI scoring, and remap logic as _synthesize()
+
+        Falls back to a plain-text SynthesisResult if JSON parsing fails.
+        """
+        import json
+
         prompt = self._build_synthesis_prompt(query, nodes)
-        async for chunk in await Settings.llm.astream_complete(prompt):
-            if chunk.delta:
-                yield chunk.delta
+
+        SCANNING, IN_ANSWER, DONE = 0, 1, 2
+        state        = SCANNING
+        escaped      = False          # previous char was backslash
+        buffer_parts: list[str] = []  # accumulate delta tokens for post-stream parse
+        scan_window  = ""             # sliding window for trigger detection
+        seen_trigger = False          # have we seen '"answer":'
+        TRIGGER      = '"answer":'
+
+        try:
+            async for chunk in await Settings.llm.astream_complete(prompt):
+                token = chunk.delta
+                if not token:
+                    continue
+                buffer_parts.append(token)
+
+                if state == DONE:
+                    continue
+
+                for ch in token:
+                    if state == SCANNING:
+                        if not seen_trigger:
+                            scan_window += ch
+                            # Keep only enough history to match the trigger
+                            if len(scan_window) > len(TRIGGER) + 2:
+                                scan_window = scan_window[-len(TRIGGER):]
+                            if TRIGGER in scan_window:
+                                seen_trigger = True
+                                scan_window = ""
+                        else:
+                            # Consuming optional whitespace before the opening quote
+                            if ch == '"':
+                                state = IN_ANSWER
+                            elif ch not in ' \t\n\r':
+                                # Unexpected non-whitespace — reset and keep scanning
+                                seen_trigger = False
+                                scan_window = ch
+
+                    elif state == IN_ANSWER:
+                        if escaped:
+                            _escape_map = {
+                                'n': '\n', 't': '\t', 'r': '\r',
+                                '"': '"',  '\\': '\\', '/': '/',
+                                'b': '\b', 'f': '\f',
+                            }
+                            yield _escape_map.get(ch, '\\' + ch)
+                            escaped = False
+                        elif ch == '\\':
+                            escaped = True
+                        elif ch == '"':
+                            state = DONE
+                        else:
+                            yield ch
+
+        except Exception as e:
+            print(f"[SecQueryEngine] WARNING: astream_complete failed ({e!r})")
+
+        # ----------------------------------------------------------------
+        # Post-stream: parse the buffered JSON and build SynthesisResult
+        # ----------------------------------------------------------------
+        full_response = "".join(buffer_parts)
+        try:
+            data = json.loads(full_response)
+            raw_answer = data.get("answer", "")
+            raw_citations = [
+                Citation(index=c["index"], quote=c.get("quote", ""))
+                for c in data.get("citations", [])
+                if isinstance(c.get("index"), int)
+            ]
+            # Apply same renumbering as _synthesize
+            quote_map: dict[int, str] = {c.index: c.quote for c in raw_citations}
+            seen: list[int] = []
+            for m in re.finditer(r'\[(\d+)\]', raw_answer):
+                idx = int(m.group(1))
+                if idx not in seen and 1 <= idx <= len(nodes):
+                    seen.append(idx)
+            for c in raw_citations:
+                if c.index not in seen and 1 <= c.index <= len(nodes):
+                    seen.append(c.index)
+
+            remap = {orig: disp for disp, orig in enumerate(seen, 1)}
+            answer = re.sub(
+                r'\[(\d+)\]',
+                lambda m: f"[{remap[int(m.group(1))]}]" if int(m.group(1)) in remap else m.group(0),
+                raw_answer,
+            )
+            cited_node_ids = [nodes[orig - 1].node_id for orig in seen]
+            cited_quotes   = [quote_map.get(orig, "") for orig in seen]
+
+            syn_response = SynthesisResponse(answer=raw_answer, citations=raw_citations)
+            data_quality = self._score_faithfulness(syn_response.answer, syn_response.citations, nodes)
+            if data_quality and remap:
+                data_quality.missing_coverage = [
+                    re.sub(r'\[(\d+)\]', lambda m: f"[{remap.get(int(m.group(1)), m.group(1))}]", s)
+                    for s in data_quality.missing_coverage
+                ]
+
+            yield SynthesisResult(
+                answer=answer,
+                cited_node_ids=cited_node_ids,
+                cited_quotes=cited_quotes,
+                data_quality=data_quality,
+            )
+        except Exception as e:
+            print(f"[SecQueryEngine] WARNING: streaming JSON parse failed ({e!r})")
+            yield SynthesisResult(
+                answer=full_response.strip(),
+                cited_node_ids=[],
+                cited_quotes=[],
+                data_quality=None,
+            )
 
     # ------------------------------------------------------------------
     # LlamaIndex-compatible interface
@@ -657,6 +891,12 @@ class _DynamicSecQueryEngine(BaseQueryEngine):
         super().__init__(callback_manager=Settings.callback_manager or CallbackManager())
 
     def _query(self, query_bundle: QueryBundle) -> RESPONSE_TYPE:
+        """
+        Synchronous LlamaIndex query entry point.
+
+        Runs _aquery on an event loop, using nest_asyncio when called from within
+        an already-running loop (e.g., Jupyter notebooks).
+        """
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -667,13 +907,14 @@ class _DynamicSecQueryEngine(BaseQueryEngine):
             return asyncio.run(self._aquery(query_bundle))
 
     async def _aquery(self, query_bundle: QueryBundle) -> RESPONSE_TYPE:
+        """Async LlamaIndex query entry point — delegates to SecQueryEngine."""
         query_str = (
             query_bundle.query_str
             if isinstance(query_bundle, QueryBundle)
             else str(query_bundle)
         )
-        nodes = await self._sec._retrieve_nodes(query_str)
+        retrieval = await self._sec._retrieve_nodes(query_str)
         if self._sec.verbose:
-            print(f"[Nodes retrieved] {len(nodes)}")
-        r = self._sec._synthesize(query_str, nodes)
+            print(f"[Nodes retrieved] {len(retrieval.nodes)}")
+        r = self._sec._synthesize(query_str, retrieval.nodes)
         return Response(response=r.answer)

@@ -6,7 +6,7 @@ representative sample of chunks from key companies and sections, then calls
 GPT-4o to generate 2 questions per chunk.
 
 Output:
-  eval/dataset.json       — EmbeddingQAFinetuneDataset (used by run_eval.py)
+  eval/dataset.json       — EmbeddingQAFinetuneDataset (used by run_retrieval_eval.py)
   eval/dataset_meta.json  — per-question metadata (ticker, section, year, etc.)
 
 Usage:

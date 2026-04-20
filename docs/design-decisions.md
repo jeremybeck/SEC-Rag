@@ -86,29 +86,9 @@ Scores are sigmoid-normalized to [0, 1] for interpretability.
 
 ### Balanced quota diversity selection
 
-The final selection stage enforces company diversity by assigning each represented ticker a guaranteed minimum chunk allocation before selecting on relevance.
+The final selection stage assigns each ticker a guaranteed chunk allocation. A soft-penalty MMR approach was tried first but failed: the reranker was cutting candidates to the final synthesis count before diversity ran, leaving minority companies with nothing to balance — observed as `{'JPM': 45, 'AAPL': 3, 'TSLA': 2}` for a 3-company query.
 
-The initial approach used a soft-penalty MMR variant that ramped down scores for over-represented companies. This failed in practice because the reranker's `top_n` pool was being cut to the final synthesis count *before* diversity selection ran. For a 3-company query where one company's filings dominated the corpus, the reranker eliminated the other companies' candidates entirely — leaving the diversity stage nothing to balance. Observed distribution: `{'JPM': 45, 'AAPL': 3, 'TSLA': 2}` for a 50-chunk synthesis window.
-
-**Current approach — hard balanced quota**:
-
-1. The reranker operates on a larger pool (`rerank_pool=200`) rather than the final synthesis count, preserving candidates from all companies through to the selection stage.
-
-2. Tickers are sorted ascending by candidate count (fewest candidates first), then each ticker receives a fair share of the remaining budget:
-
-```python
-for i, ticker in enumerate(ordered_by_count):
-    n_left = len(ordered) - i
-    fair   = ceil(remaining_budget / n_left)
-    quota[ticker] = min(len(candidates[ticker]), fair)
-    remaining_budget -= quota[ticker]
-```
-
-Within each ticker's quota, chunks are selected in descending reranker score order.
-
-This guarantees roughly equal representation for all companies named in the query regardless of how many chunks each company has in the reranker pool. A company with fewer high-scoring chunks is protected from being crowded out by a company with many.
-
-The tradeoff is that a focused single-company query now receives a lower average chunk relevance than it would under pure relevance sorting — some slots go to lower-scoring chunks from a single company. In practice this is acceptable: single-company queries still saturate their quota with high-scoring material.
+The fix was to expand the reranker pool to 200 and replace soft penalties with a hard per-ticker quota, allocated proportionally with fewest-candidate tickers going first. The tradeoff is slightly lower average chunk relevance on single-company queries, which is acceptable in practice.
 
 ---
 
@@ -142,25 +122,11 @@ Citation numbers in the answer are renumbered by first appearance, so the user s
 
 ### NLI faithfulness scoring (post-hoc)
 
-After synthesis, a `cross-encoder/nli-deberta-v3-small` model scores each cited claim in the answer against its source excerpt independently of the LLM. This replaces the earlier approach of asking the LLM to self-rate its own confidence — which was systematically optimistic because the model cannot cleanly distinguish retrieved context from parametric memory.
+After synthesis, `cross-encoder/nli-deberta-v3-small` scores each cited sentence in the answer against its source excerpt — independently of the LLM that wrote the answer. This replaces LLM self-assessment, which was systematically optimistic: the model couldn't cleanly distinguish what it retrieved from what it already knew, and rated ~30% of answers HIGH when an independent judge scored them below the HIGH threshold.
 
-**Scoring process** (`_score_faithfulness` in `sec_query.py`):
+Post-hoc NLI is blind to the generation process — it only measures whether the cited source text actually entails the stated claim. A numeric containment fallback handles tabular financial data that the NLI model can't parse semantically. Mean sentence score maps to HIGH (≥ 0.75), MEDIUM (≥ 0.45), or LOW (< 0.45).
 
-1. Sentence-split the answer. For each sentence containing `[N]` citation markers, find the corresponding quoted excerpts from the `citations` list.
-2. **Grounding check**: if the LLM's verbatim quote cannot be found in the raw chunk text, fall back to the first 600 characters of the raw chunk as the NLI premise. LLMs frequently paraphrase rather than copy verbatim, so this fallback ensures the NLI model always has a valid premise.
-3. Strip `[N]` markers from the hypothesis before building NLI pairs — they are out-of-distribution tokens for MNLI/SNLI-trained models and systematically reduce entailment confidence.
-4. Run batch NLI inference. Label order for this model: `[contradiction=0, neutral=1, entailment=2]`. Entailment probability = `softmax(logits)[2]`.
-5. **Numeric containment fallback**: for sentences with specific financial figures (dollar amounts, percentages, share counts), check whether those numbers appear in the source text even if NLI scores low. Tabular data like `"416.161"` in a pipe-delimited table scores near-zero on NLI semantically but is clearly grounded.
-6. Per-sentence score = `max(NLI entailment, numeric containment)`. Mean over all cited sentences.
-7. Map mean score to rating: HIGH (≥ 0.75), MEDIUM (≥ 0.45), LOW (< 0.45).
-
-The `DataQualityAssessment` returned by `_score_faithfulness` carries `rating`, `summary`, `missing_coverage` (sentences scoring below 0.45), and `nli_score` (raw mean float).
-
-**Why not LLM self-assessment?**
-
-Synthesis evaluation showed ~30% overconfidence when the system self-rated: the model recalled financial figures from training memory, cited a related but vague excerpt, and rated itself HIGH. The judge found the specific number absent from the cited text. Post-hoc NLI is blind to the LLM's generation process — it only measures whether the cited source text actually entails the stated claim.
-
-The NLI approach is not a complete solution: it measures sentence-level entailment of cited claims only, not correctness of uncited claims or whether the right document was retrieved in the first place.
+The limitation: NLI measures entailment of cited claims only. It doesn't catch fabrications in uncited sentences or cases where the right answer was retrieved but the wrong document was cited.
 
 ### Prompt iterations (`src/prompts/`)
 
@@ -219,23 +185,6 @@ Two structural changes in v6 addressed this:
 
 3. **Comparison paragraph (Step 5)**: When the question contains comparison language ("compare", "contrast", "how do they differ", "versus", "similarities and differences"), the model is required to draft a dedicated `**Comparison**` paragraph after the per-company paragraphs. The paragraph must synthesize only facts already cited above — no new claims — and explicitly name the key similarities and differences. The Step 6 audit includes a checkbox for this paragraph.
 
-### Streaming synthesis
-
-`structured_predict` blocks until the LLM has generated the full JSON response, which means the user sees nothing for 5–15 seconds. To improve perceived latency, synthesis was converted to an SSE streaming architecture:
-
-1. The server emits `filters` and `nodes` SSE events before the LLM call begins, so the retrieved documents sidebar populates immediately.
-2. `_synthesize_streaming` calls `Settings.llm.astream_complete(prompt)` and runs a character-level state machine over the token stream:
-   - **SCANNING**: accumulates a sliding window looking for `"answer":` in the raw JSON stream
-   - **IN_ANSWER**: yields each character (handling JSON escape sequences: `\n`, `\"`, `\\`, etc.) until the closing unescaped `"`
-   - **DONE**: discards remaining tokens while still buffering them
-3. Each yielded character is wrapped as a `{"type": "token", "data": "<char>"}` SSE event. The frontend appends tokens to the answer as they arrive.
-4. After streaming completes, the buffered full response is `json.loads()`-parsed to extract citations. The same renumbering and NLI scoring logic as the non-streaming path runs at this point.
-5. A final `{"type": "answer", "data": "<remapped_answer>"}` SSE event replaces the streamed content with the citation-renumbered version (original chunk indices like `[15]` replaced with display-order `[1]`, `[2]`, `[3]`).
-
-The tradeoff: the user sees the raw chunk indices during streaming, then sees a brief correction when the remapped answer arrives. This is preferable to waiting for the full response.
-
-NLI scoring still happens after streaming on the blocking path (it cannot be streamed), so the quality assessment and source chips appear after a short delay following the end of the answer stream.
-
 ### Context window tradeoff
 
 Sending 50 chunks to the model maximizes the chance that every company relevant to a comparative question is represented. The tradeoff is that the model must attend over a large, heterogeneous context — 50 chunks from potentially 8–10 different companies and filing years — in a single pass.
@@ -255,4 +204,3 @@ This is inherently harder than a focused single-company query. The prompt includ
 | Cross-encoder reranking           | Precision improvement over cosine similarity | ~200ms local inference latency added |
 | Balanced quota MMR                | Guaranteed per-company coverage for comparative queries | Single-company queries receive lower average chunk relevance |
 | NLI post-hoc faithfulness         | Objective, reproducible faithfulness signal independent of LLM | Sentence-level only; doesn't catch uncited fabrications or wrong-document retrieval |
-| Streaming synthesis               | Answer appears immediately; nodes sidebar updates before LLM call | Citation indices shown during streaming are raw; corrected after stream ends |

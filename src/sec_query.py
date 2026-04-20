@@ -804,7 +804,23 @@ class SecQueryEngine:
         # ----------------------------------------------------------------
         full_response = "".join(buffer_parts)
         try:
-            data = json.loads(full_response)
+            # astream_complete has no JSON mode enforcement, so GPT-4o occasionally
+            # wraps output in markdown code fences (```json ... ```). Strip them first,
+            # then fall back to extracting the outermost {...} if parsing still fails.
+            clean = full_response.strip()
+            if clean.startswith("```"):
+                clean = re.sub(r'^```(?:json)?\s*', '', clean)
+                clean = re.sub(r'\s*```\s*$', '', clean).strip()
+            try:
+                data = json.loads(clean)
+            except json.JSONDecodeError:
+                # Last resort: find the outermost JSON object by brace matching
+                start = clean.find('{')
+                end   = clean.rfind('}')
+                if start != -1 and end != -1:
+                    data = json.loads(clean[start:end + 1])
+                else:
+                    raise
             raw_answer = data.get("answer", "")
             raw_citations = [
                 Citation(index=c["index"], quote=c.get("quote", ""))

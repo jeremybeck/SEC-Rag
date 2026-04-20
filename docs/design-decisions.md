@@ -104,15 +104,12 @@ The output schema (enforced via Pydantic):
 {
   "answer": "prose with inline [N] citation markers",
   "citations": [
-    {"index": N, "quote": "verbatim sentence from excerpt N"}
-  ],
-  "data_quality": {
-    "rating": "HIGH | MEDIUM | LOW",
-    "summary": "...",
-    "missing_coverage": ["..."]
-  }
+    {"index": N, "quote": "verbatim phrase from excerpt N"}
+  ]
 }
 ```
+
+Data quality assessment (`rating`, `summary`, `missing_coverage`) is produced separately by the NLI scorer after synthesis, not by the LLM.
 
 ### Citation design
 

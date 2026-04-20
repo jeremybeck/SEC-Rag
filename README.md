@@ -23,22 +23,8 @@ flowchart TD
         LLM --> NLI
     end
 
-    subgraph Output["SSE Events"]
-        F[① filters]
-        N[② nodes]
-        T[③ tokens]
-        A[④ answer]
-        QA[⑤ quality]
-        S[⑥ sources]
-    end
-
     MMR --> LLM
-    QP -->|immediate| F
-    MMR -->|before LLM| N
-    LLM -->|streaming| T
-    LLM -->|remapped| A
-    NLI --> QA
-    NLI --> S
+    NLI --> R([Answer + Citations + Quality])
 ```
 
 ## Design

@@ -60,7 +60,7 @@ python src/build_index.py
 
 This will:
 1. Read all filings listed in `files/edgar_corpus/manifest.json`
-2. Chunk each document (1200 tokens, 150 overlap)
+2. Chunk each document (800 tokens, 200 overlap)
 3. Call the OpenAI embeddings API to generate vectors
 4. Write all embeddings into the `sec_embeddings` table in pgvector
 
@@ -115,3 +115,7 @@ docker compose down -v
 ## Design
 
 See [Design Decisions](docs/design-decisions.md) for the reasoning behind key architectural choices in indexing, retrieval, and synthesis.
+
+## Evaluation
+
+See [Evaluation](docs/evaluation.md) for methodology, results, and how findings drove system changes.

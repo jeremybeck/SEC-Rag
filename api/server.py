@@ -1,24 +1,26 @@
 """
 api/server.py — FastAPI server for SEC-Rag.
 
-Exposes a single POST /query endpoint that streams results as Server-Sent Events.
+Exposes POST /query (SSE) and POST /feedback endpoints.
 
-Events (in order):
-  {"type": "plan",    "data": {tickers, years, filing_types, reasoning}}
-  {"type": "nodes",   "data": [{node_id, ticker, filing_type, fiscal_year, fiscal_quarter, section_label, score, text_preview}]}
-  {"type": "token",   "data": "<answer>"}  (one event containing the complete answer)
-  {"type": "sources", "data": [{ticker, filing_type, fiscal_year, section_label, node_id}]}
+SSE event sequence for /query:
+  {"type": "filters", "data": {tickers, years, industries}}          — immediate, pre-retrieval
+  {"type": "nodes",   "data": [{node_id, ticker, filing_type, ...}]} — after retrieval pipeline
+  {"type": "token",   "data": "<chunk>"}                             — streamed answer characters (multiple events, raw indices)
+  {"type": "answer",  "data": "<answer>"}                            — final answer with remapped citation indices (replaces streamed text)
+  {"type": "quality", "data": {rating, summary, missing_coverage}}   — NLI faithfulness result
+  {"type": "sources", "data": [{ticker, ..., citation_index, quote}]}— one entry per citation
   {"type": "done"}
-  {"type": "error",   "data": "<message>"}  (on exception)
+  {"type": "error",   "data": "<message>"}                           — on exception
 
 Usage:
     uvicorn api.server:app --reload --port 8000
 """
 
+import asyncio
 import json
 import os
 import sys
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -40,6 +42,14 @@ from sec_query import SecQueryEngine
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan context manager.
+
+    On startup: initialises LlamaIndex settings, loads the pgvector index,
+    creates the SecQueryEngine (which pre-loads both the cross-encoder reranker
+    and the DeBERTa NLI model), and sets up the asyncpg feedback pool.
+    On shutdown: closes the feedback pool.
+    """
     Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
     Settings.llm = OpenAI(model="gpt-4o")
 
@@ -96,6 +106,7 @@ class FeedbackRequest(BaseModel):
 
 
 def _event(payload: dict) -> dict:
+    """Wrap a dict as an SSE data frame for sse-starlette."""
     return {"data": json.dumps(payload)}
 
 
@@ -106,27 +117,45 @@ async def query_endpoint(request: Request, body: QueryRequest):
 
     async def event_generator():
         try:
+            # Stage 0: Emit metadata filters immediately — fast spaCy + regex, no I/O
+            filters = engine.parse_query_filters(query)
+            yield _event({"type": "filters", "data": filters})
+
             # Stage 1: Retrieve nodes (no LLM, pure vector search)
-            nodes = await engine._retrieve_nodes(query)
+            retrieval = await engine._retrieve_nodes(query)
+            nodes = retrieval.nodes
 
             nodes_payload = []
             for n in nodes:
                 m = n.node.metadata
                 nodes_payload.append({
-                    "node_id":       n.node_id,
-                    "ticker":        m.get("ticker"),
-                    "filing_type":   m.get("filing_type"),
-                    "fiscal_year":   m.get("fiscal_year"),
+                    "node_id":        n.node_id,
+                    "ticker":         m.get("ticker"),
+                    "filing_type":    m.get("filing_type"),
+                    "fiscal_year":    m.get("fiscal_year"),
                     "fiscal_quarter": m.get("fiscal_quarter"),
-                    "section_label": m.get("section_label"),
-                    "score":         round(float(n.score), 4) if n.score is not None else None,
-                    "text_preview":  n.node.get_content()[:300],
+                    "section_label":  m.get("section_label"),
+                    "score":          round(float(n.score), 4) if n.score is not None else None,
+                    "text_preview":   n.node.get_content()[:300],
                 })
             yield _event({"type": "nodes", "data": nodes_payload})
 
-            # Stage 3: Synthesize answer (single LLM call)
-            result = engine._synthesize(query, nodes)
-            yield _event({"type": "token", "data": result.answer})
+            # Stage 3: Stream synthesis answer token by token, collect final result
+            result = None
+            async for item in engine._synthesize_streaming(query, nodes):
+                if isinstance(item, str):
+                    yield _event({"type": "token", "data": item})
+                else:
+                    result = item
+
+            if result is None:
+                # Streaming yielded nothing — fall back to blocking synthesis
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, engine._synthesize, query, nodes
+                )
+
+            # Replace the streamed raw-index answer with the remapped display answer
+            yield _event({"type": "answer", "data": result.answer})
 
             # Stage 3b: Data quality assessment
             if result.data_quality is not None:
@@ -136,43 +165,24 @@ async def query_endpoint(request: Request, body: QueryRequest):
                     "missing_coverage": result.data_quality.missing_coverage,
                 }})
 
-            # Stage 4: Sources — deduplicated by section, collecting all citation indices per section
-            cited_set = set(result.cited_node_ids)
-            node_id_to_citation_index = {nid: i + 1 for i, nid in enumerate(result.cited_node_ids)}
-            node_id_to_quote = dict(zip(result.cited_node_ids, result.cited_quotes))
-
-            # First pass: group all citation indices and quotes by section key
-            section_indices: dict = defaultdict(list)
-            section_quotes:  dict = defaultdict(list)
-            section_node_id: dict = {}
-            section_meta:    dict = {}
-            for n in nodes:
-                if n.node_id not in cited_set:
-                    continue
-                m = n.node.metadata
-                key = (m.get("ticker"), m.get("filing_type"), m.get("fiscal_year"), m.get("section_label"))
-                section_indices[key].append(node_id_to_citation_index[n.node_id])
-                q = node_id_to_quote.get(n.node_id, "")
-                if q:
-                    section_quotes[key].append(q)
-                if key not in section_node_id:
-                    section_node_id[key] = n.node_id
-                    section_meta[key] = m
-
-            # Second pass: build sources in citation-index order (sort by first index in each group)
+            # Stage 4: Sources — one entry per citation index, each with its own quote
+            node_lookup = {n.node_id: n for n in nodes}
             sources = []
-            for key in sorted(section_indices, key=lambda k: section_indices[k][0]):
-                m = section_meta[key]
-                indices = sorted(section_indices[key])
-                quotes  = section_quotes[key]
+            for i, nid in enumerate(result.cited_node_ids):
+                citation_index = i + 1
+                quote = result.cited_quotes[i] if i < len(result.cited_quotes) else ""
+                node = node_lookup.get(nid)
+                if node is None:
+                    continue
+                m = node.node.metadata
                 sources.append({
-                    "ticker":           m.get("ticker"),
-                    "filing_type":      m.get("filing_type"),
-                    "fiscal_year":      m.get("fiscal_year"),
-                    "section_label":    m.get("section_label"),
-                    "node_id":          section_node_id[key],
-                    "citation_indices": indices,
-                    "quote":            quotes[0] if quotes else "",
+                    "ticker":         m.get("ticker"),
+                    "filing_type":    m.get("filing_type"),
+                    "fiscal_year":    m.get("fiscal_year"),
+                    "section_label":  m.get("section_label"),
+                    "node_id":        nid,
+                    "citation_index": citation_index,
+                    "quote":          quote,
                 })
             yield _event({"type": "sources", "data": sources})
 
@@ -186,6 +196,7 @@ async def query_endpoint(request: Request, body: QueryRequest):
 
 @app.post("/feedback", status_code=204)
 async def submit_feedback(request: Request, body: FeedbackRequest):
+    """Persist a thumbs-up/down rating and optional free-text to query_feedback."""
     pool = request.app.state.feedback_pool
     async with pool.acquire() as conn:
         await conn.execute(

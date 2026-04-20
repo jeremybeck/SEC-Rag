@@ -29,7 +29,7 @@ Calibration:
     (fallback / no rating)         = N/A
 
 Output:
-  eval/results_synthesis_eval.csv  — one row per question, 25 columns
+  eval/results_synthesis_eval_final.csv  — one row per question, 25 columns
   Summary printed to stdout.
 
 Requires:
@@ -63,7 +63,7 @@ from index_loader import load_index
 from sec_query import SecQueryEngine, SynthesisResult
 
 EVAL_DIR = Path(__file__).parent
-OUT_CSV  = EVAL_DIR / "results_synthesis_eval.csv"
+OUT_CSV  = EVAL_DIR / "results_synthesis_eval_final.csv"
 
 SEED = 42
 
@@ -290,11 +290,14 @@ def judge_answer(
         context=context,
     )
     try:
-        result: JudgeResult = judge_llm.structured_predict(
+        result = judge_llm.structured_predict(
             JudgeResult,
             PromptTemplate("{prompt_str}"),
             prompt_str=prompt_text,
         )
+        if not isinstance(result, JudgeResult):
+            print(f"  [judge] WARNING: structured_predict returned {type(result).__name__}, expected JudgeResult")
+            return None
         return result
     except Exception as e:
         print(f"  [judge] WARNING: structured_predict failed ({e})")
@@ -310,10 +313,17 @@ def calibration_status(
     faithfulness: float | None,
 ) -> str:
     """
-    CORRECT       — system rating matches faithfulness bucket
-    OVERCONFIDENT — system claims more certainty than judge supports
+    CORRECT        — system NLI rating matches judge faithfulness bucket
+    OVERCONFIDENT  — system claims more certainty than judge supports
     UNDERCONFIDENT — system claims less certainty than judge supports
-    N/A           — missing data (no rating or no judge result)
+    N/A            — missing data (no rating or no judge result)
+
+    Thresholds aligned to NLI model rating cutoffs:
+      HIGH   → faithfulness >= 0.75  = CORRECT, else OVERCONFIDENT
+      MEDIUM → 0.45 <= faith < 0.75  = CORRECT
+                faith >= 0.75        = UNDERCONFIDENT
+                faith < 0.45         = OVERCONFIDENT
+      LOW    → faithfulness < 0.45   = CORRECT, else UNDERCONFIDENT
     """
     if system_rating is None or faithfulness is None:
         return "N/A"
@@ -322,16 +332,16 @@ def calibration_status(
     f = faithfulness
 
     if r == "HIGH":
-        return "CORRECT" if f >= 0.8 else "OVERCONFIDENT"
+        return "CORRECT" if f >= 0.75 else "OVERCONFIDENT"
     elif r == "MEDIUM":
-        if 0.5 <= f < 0.8:
+        if 0.45 <= f < 0.75:
             return "CORRECT"
-        elif f >= 0.8:
+        elif f >= 0.75:
             return "UNDERCONFIDENT"
         else:
             return "OVERCONFIDENT"
     elif r == "LOW":
-        return "CORRECT" if f < 0.5 else "UNDERCONFIDENT"
+        return "CORRECT" if f < 0.45 else "UNDERCONFIDENT"
     return "N/A"
 
 
@@ -356,16 +366,18 @@ async def eval_one(
     print(f"  [{idx}/{total}] [{strata}] {ticker} FY{fy}  {query[:80]}...")
 
     # --- Retrieve ---
-    nodes = await engine._retrieve_nodes(query)
+    retrieval = await engine._retrieve_nodes(query)
+    nodes = retrieval.nodes
     n_retrieved = len(nodes)
     retrieved_tickers = sorted({n.node.metadata.get("ticker", "") for n in nodes})
 
     # --- Synthesize ---
     result: SynthesisResult = engine._synthesize(query, nodes)
 
-    system_rating   = result.data_quality.rating if result.data_quality else None
-    system_summary  = result.data_quality.summary if result.data_quality else ""
+    system_rating   = result.data_quality.rating    if result.data_quality else None
+    system_summary  = result.data_quality.summary   if result.data_quality else ""
     missing_cov_str = "; ".join(result.data_quality.missing_coverage) if result.data_quality else ""
+    nli_score       = result.data_quality.nli_score if result.data_quality else None
 
     n_cited      = len(result.cited_node_ids)
     cited_tickers = sorted({
@@ -404,8 +416,9 @@ async def eval_one(
         "cited_tickers":      ",".join(cited_tickers),
         "year_aligned":       "" if year_aligned is None else str(year_aligned),
 
-        # System self-assessment
+        # System NLI assessment
         "system_rating":      system_rating or "",
+        "nli_score":          "" if nli_score is None else nli_score,
         "system_summary":     system_summary,
         "missing_coverage":   missing_cov_str,
 
@@ -442,11 +455,15 @@ def print_report(rows: list[dict]) -> None:
     faith_values = [float(r["faithfulness"]) for r in with_judge]
     rel_values   = [float(r["relevance"])     for r in with_judge]
 
+    nli_values = [float(r["nli_score"]) for r in rows if r.get("nli_score") not in ("", None)]
+
     print(f"\n{'='*60}")
     print(f"SYNTHESIS EVAL REPORT  (n={total}, judged={len(with_judge)})")
     print(f"{'='*60}")
     print(f"  Mean faithfulness : {_mean(faith_values):.3f}")
     print(f"  Mean relevance    : {_mean(rel_values):.3f}")
+    if nli_values:
+        print(f"  Mean NLI score    : {_mean(nli_values):.3f}  (n={len(nli_values)})")
 
     # By strata
     strata_names = ["A_10Q", "B_10K", "C_trend", "D_no_year"]
@@ -460,9 +477,9 @@ def print_report(rows: list[dict]) -> None:
         sr = _mean([float(r["relevance"])     for r in s_rows])
         print(f"  {s:<14}  {len(s_rows):>4}  {sf:>7.3f}  {sr:>7.3f}")
 
-    # Faithfulness by system rating
-    print(f"\n  {'System rating':<14}  {'N':>4}  {'Mean faith':>11}  {'Overconf%':>10}  {'Underconf%':>11}")
-    print(f"  {'-'*58}")
+    # Faithfulness by system NLI rating
+    print(f"\n  {'System NLI rating':<18}  {'N':>4}  {'Mean faith':>11}  {'Overconf%':>10}  {'Underconf%':>11}")
+    print(f"  {'-'*62}")
     for rating in ["HIGH", "MEDIUM", "LOW"]:
         r_rows = [r for r in with_judge if r["system_rating"] == rating]
         if not r_rows:
@@ -470,7 +487,7 @@ def print_report(rows: list[dict]) -> None:
         mf = _mean([float(r["faithfulness"]) for r in r_rows])
         oc = sum(1 for r in r_rows if r["calibration_status"] == "OVERCONFIDENT") / len(r_rows)
         uc = sum(1 for r in r_rows if r["calibration_status"] == "UNDERCONFIDENT") / len(r_rows)
-        print(f"  {rating:<14}  {len(r_rows):>4}  {mf:>11.3f}  {oc:>9.1%}  {uc:>10.1%}")
+        print(f"  {rating:<18}  {len(r_rows):>4}  {mf:>11.3f}  {oc:>9.1%}  {uc:>10.1%}")
 
     # Calibration summary
     cal_counts = {}

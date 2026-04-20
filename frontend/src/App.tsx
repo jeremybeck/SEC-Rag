@@ -8,7 +8,7 @@ import { StreamingAnswer } from './components/StreamingAnswer';
 import { SourceChips } from './components/SourceChips';
 
 export default function App() {
-  const { nodes, answer, sources, dataQuality, isStreaming, error, submitQuery } = useQuery();
+  const { nodes, answer, sources, dataQuality, filterInfo, isStreaming, error, submitQuery } = useQuery();
   const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(new Set());
   const [scrollTargetId, setScrollTargetId] = useState<string | null>(null);
   const [currentQuery, setCurrentQuery] = useState<string | null>(null);
@@ -38,7 +38,7 @@ export default function App() {
       {/* Header */}
       <div className="px-4 py-3 border-b border-slate-200 bg-white flex items-center gap-3 shrink-0">
         <div className="w-2 h-2 rounded-full bg-indigo-500" />
-        <h1 className="text-sm font-semibold text-slate-700 tracking-wide">SEC Filings RAG</h1>
+        <h1 className="text-sm font-semibold text-slate-700 tracking-wide">Query SEC Filings</h1>
       </div>
 
       {/* Main body: answer (left) + nodes sidebar (right) */}
@@ -49,6 +49,17 @@ export default function App() {
             <div className="px-6 pt-5 pb-3 shrink-0">
               <p className="text-[10px] uppercase tracking-wider text-slate-400 mb-1">Question</p>
               <p className="text-base font-medium text-slate-800">{currentQuery}</p>
+              {filterInfo && (filterInfo.tickers.length > 0 || filterInfo.years.length > 0) && (
+                <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] uppercase tracking-wider text-slate-400">Filters</span>
+                  {filterInfo.tickers.map((t) => (
+                    <span key={t} className="px-1.5 py-0.5 rounded text-[11px] font-mono font-medium bg-indigo-50 text-indigo-700 border border-indigo-200">{t}</span>
+                  ))}
+                  {filterInfo.years.map((y) => (
+                    <span key={y} className="px-1.5 py-0.5 rounded text-[11px] font-mono bg-slate-100 text-slate-600 border border-slate-200">FY{y}</span>
+                  ))}
+                </div>
+              )}
             </div>
           )}
           {error ? (
@@ -61,11 +72,9 @@ export default function App() {
             <StreamingAnswer answer={answer} isStreaming={isStreaming} />
           )}
 
-          {/* DataQualityBadge hidden — re-enable once confidence calibration is improved
           {dataQuality && !isStreaming && (
             <DataQualityBadge quality={dataQuality} />
           )}
-          */}
 
           <div className="shrink-0">
             <SourceChips sources={sources} onActivate={activateNode} expandedNodeIds={expandedNodeIds} />

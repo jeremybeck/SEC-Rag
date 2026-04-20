@@ -84,7 +84,7 @@ export function NodesSidebar({ nodes, expandedNodeIds, onToggle, scrollTargetId,
     <div className="h-full flex flex-col border-l border-slate-200 bg-slate-50 w-72 shrink-0">
       <div className="px-3 py-2.5 border-b border-slate-200">
         <h2 className="text-xs font-semibold uppercase tracking-wider text-indigo-600">
-          Retrieved Nodes
+          Relevant Docs
           {nodes.length > 0 && (
             <span className="ml-2 text-slate-400 normal-case font-normal">
               ({nodes.length})

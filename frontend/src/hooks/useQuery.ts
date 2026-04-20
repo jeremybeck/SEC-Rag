@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react';
-import type { NodeData, SourceData, DataQualityAssessment, SSEEvent } from '../types';
+import type { NodeData, SourceData, DataQualityAssessment, FilterInfo, SSEEvent } from '../types';
 
 const API_URL = 'http://localhost:8000/query';
 
@@ -8,6 +8,7 @@ export function useQuery() {
   const [answer, setAnswer] = useState('');
   const [sources, setSources] = useState<SourceData[]>([]);
   const [dataQuality, setDataQuality] = useState<DataQualityAssessment | null>(null);
+  const [filterInfo, setFilterInfo] = useState<FilterInfo | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -20,6 +21,7 @@ export function useQuery() {
     setAnswer('');
     setSources([]);
     setDataQuality(null);
+    setFilterInfo(null);
     setError(null);
     answerRef.current = '';
     setIsStreaming(true);
@@ -67,9 +69,17 @@ export function useQuery() {
             case 'nodes':
               setNodes(event.data);
               break;
+            case 'filters':
+              setFilterInfo(event.data);
+              break;
             case 'token':
               answerRef.current += event.data;
               setAnswer(answerRef.current);
+              break;
+            case 'answer':
+              // Replace streamed text with final remapped-citation version
+              answerRef.current = event.data;
+              setAnswer(event.data);
               break;
             case 'quality':
               setDataQuality(event.data);
@@ -92,5 +102,5 @@ export function useQuery() {
     }
   }
 
-  return { nodes, answer, sources, dataQuality, isStreaming, error, submitQuery };
+  return { nodes, answer, sources, dataQuality, filterInfo, isStreaming, error, submitQuery };
 }

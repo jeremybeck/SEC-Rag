@@ -34,6 +34,14 @@ CHUNK_OVERLAP = 200
 
 
 def main() -> None:
+    """
+    Build the pgvector index from the edgar_corpus filing archive.
+
+    Reads all filings listed in manifest.json, chunks each document
+    (CHUNK_SIZE tokens, CHUNK_OVERLAP overlap), calls the OpenAI embeddings
+    API to generate vectors, and writes everything to the sec_embeddings table.
+    Only needs to run once, or again when new filings are added to the corpus.
+    """
     Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
 
     print(f"Corpus dir: {CORPUS_DIR}")

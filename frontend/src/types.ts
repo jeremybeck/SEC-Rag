@@ -15,7 +15,7 @@ export interface SourceData {
   fiscal_year: number;
   section_label: string;
   node_id: string;
-  citation_indices: number[];
+  citation_index: number;
   quote: string;
 }
 
@@ -25,9 +25,17 @@ export interface DataQualityAssessment {
   missing_coverage: string[];
 }
 
+export interface FilterInfo {
+  tickers:    string[];
+  years:      number[];
+  industries: string[];
+}
+
 export type SSEEvent =
   | { type: 'nodes';   data: NodeData[] }
+  | { type: 'filters'; data: FilterInfo }
   | { type: 'token';   data: string }
+  | { type: 'answer';  data: string }
   | { type: 'quality'; data: DataQualityAssessment }
   | { type: 'sources'; data: SourceData[] }
   | { type: 'done' }

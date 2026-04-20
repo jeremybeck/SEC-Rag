@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 from llama_index.core import VectorStoreIndex
 from llama_index.vector_stores.postgres import PGVectorStore
 
-EMBED_DIM  = 1536
+EMBED_DIM  = 1536        # text-embedding-3-small output dimension
 TABLE_NAME = "sec_embeddings"
 
 
@@ -59,9 +59,9 @@ def get_vector_store() -> PGVectorStore:
             "max_overflow": 20,
         },
         hnsw_kwargs={
-            "hnsw_m": 16,
-            "hnsw_ef_construction": 64,
-            "hnsw_ef_search": 40,
+            "hnsw_m": 16,                          # neighbours per node — higher = better recall, more memory
+            "hnsw_ef_construction": 64,            # build-time beam width
+            "hnsw_ef_search": 40,                  # query-time beam width — raise for better recall vs. latency
             "hnsw_dist_method": "vector_cosine_ops",
         },
     )

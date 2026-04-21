@@ -20,6 +20,12 @@ Each SEC filing is parsed from its raw EDGAR text file. The filename encodes the
 
 Section labels are normalized from the SEC's standard Item numbering (Item 1, Item 1A, Item 7, etc.) into human-readable labels. This makes them usable in both the UI (source chips) and metadata filters.
 
+### Embedding model
+
+Chunks are embedded using OpenAI's `text-embedding-3-small` (1536 dimensions, via `llama_index.embeddings.openai.OpenAIEmbedding`). Vectors are stored in the `sec_embeddings` pgvector table and queried via cosine similarity ANN search. The same model is used at both index time and query time — a requirement for consistent similarity scoring.
+
+`text-embedding-3-small` was chosen over `text-embedding-ada-002` for its improved retrieval performance at the same cost, and over `text-embedding-3-large` to keep per-chunk API cost low at the index size (~tens of thousands of chunks across all filings).
+
 ### Chunk enrichment — context in the embedding
 
 Each chunk is prepended with a structured header before embedding:
